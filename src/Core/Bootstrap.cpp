@@ -1,6 +1,6 @@
 #include "Bootstrap.h"
 #include "Engine.h"
-#include <iostream>
+#include "Logging/Logger.h"
 #include <windows.h>
 
 /**
@@ -25,7 +25,7 @@ namespace Bootstrap {
     bool LoadIntoProcess(const std::string& dllPath) {
         auto& engine = Engine::GetInstance();
         if (!engine.IsAttached()) {
-            std::cerr << "[Bootstrap] Not attached to a process" << std::endl;
+            LOG_ERROR("[Bootstrap] Not attached to a process");
             return false;
         }
 
@@ -37,16 +37,14 @@ namespace Bootstrap {
                                             MEM_COMMIT | MEM_RESERVE,
                                             PAGE_READWRITE);
         if (!pRemoteMem) {
-            std::cerr << "[Bootstrap] VirtualAllocEx failed (error: "
-                      << GetLastError() << ")" << std::endl;
+            LOG_ERROR("[Bootstrap] VirtualAllocEx failed (error: %lu)", GetLastError());
             return false;
         }
 
         // Step 2: Write the DLL path into the allocated remote memory
         if (!WriteProcessMemory(hProcess, pRemoteMem, dllPath.c_str(),
                                 pathSize, nullptr)) {
-            std::cerr << "[Bootstrap] WriteProcessMemory failed (error: "
-                      << GetLastError() << ")" << std::endl;
+            LOG_ERROR("[Bootstrap] WriteProcessMemory failed (error: %lu)", GetLastError());
             VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
             return false;
         }
@@ -57,7 +55,7 @@ namespace Bootstrap {
         LPTHREAD_START_ROUTINE pLoadLibraryA = reinterpret_cast<LPTHREAD_START_ROUTINE>(
             GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryA"));
         if (!pLoadLibraryA) {
-            std::cerr << "[Bootstrap] GetProcAddress(LoadLibraryA) failed" << std::endl;
+            LOG_ERROR("[Bootstrap] GetProcAddress(LoadLibraryA) failed");
             VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
             return false;
         }
@@ -67,14 +65,13 @@ namespace Bootstrap {
                                                     pLoadLibraryA,
                                                     pRemoteMem, 0, nullptr);
         if (!hRemoteThread) {
-            std::cerr << "[Bootstrap] CreateRemoteThread failed (error: "
-                      << GetLastError() << ")" << std::endl;
+            LOG_ERROR("[Bootstrap] CreateRemoteThread failed (error: %lu)", GetLastError());
             VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
             return false;
         }
 
         // Step 5: Wait for the remote thread to complete
-        std::cout << "[Bootstrap] Waiting for remote LoadLibraryA to complete..." << std::endl;
+        LOG_INFO("[Bootstrap] Waiting for remote LoadLibraryA to complete...");
         WaitForSingleObject(hRemoteThread, INFINITE);
 
         // Get the thread's exit code (return value of LoadLibraryA = HMODULE base)
@@ -86,13 +83,11 @@ namespace Bootstrap {
         VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
 
         if (exitCode == 0) {
-            std::cerr << "[Bootstrap] LoadLibraryA returned NULL — DLL may have "
-                         "failed to load or path was not found" << std::endl;
+            LOG_ERROR("[Bootstrap] LoadLibraryA returned NULL — DLL may have failed to load or path not found");
             return false;
         }
 
-        std::cout << "[Bootstrap] DLL loaded at remote base 0x"
-                  << std::hex << exitCode << std::dec << std::endl;
+        LOG_INFO("[Bootstrap] DLL loaded at remote base 0x%lX", exitCode);
         return true;
     }
 

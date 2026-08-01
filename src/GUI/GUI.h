@@ -123,11 +123,8 @@ private:
 
     // ---- Console state ----
     char m_luaInputBuffer[4096] = {};
-    std::vector<std::string> m_logLines;
     std::vector<std::string> m_consoleHistory;
     int m_historyPos = -1;
-    bool m_scrollToBottom = false;
-    bool m_reclaimFocus = false;
 
     // ---- Tab state ----
     struct ObjectEntry {

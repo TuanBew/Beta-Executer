@@ -6,10 +6,11 @@
 
 #include "GUI.h"
 
-#include <iostream>
+#include "Logging/Logger.h"
 #include <fstream>
 #include <algorithm>
 #include <cstring>
+#include <ctime>
 
 // ImGui headers
 #include <imgui.h>
@@ -45,7 +46,7 @@ GUI::~GUI() {
 // ============================================================
 
 void GUI::GlfwErrorCallback(int error, const char* description) {
-    std::cerr << "[GUI] GLFW Error " << error << ": " << description << std::endl;
+    LOG_ERROR("[GUI] GLFW Error %d: %s", error, description);
 }
 
 bool GUI::Initialize(const std::string& title, int width, int height) {
@@ -53,7 +54,7 @@ bool GUI::Initialize(const std::string& title, int width, int height) {
     glfwSetErrorCallback(GlfwErrorCallback);
 
     if (!glfwInit()) {
-        std::cerr << "[GUI] Failed to initialize GLFW" << std::endl;
+        LOG_ERROR("[GUI] Failed to initialize GLFW");
         return false;
     }
 
@@ -65,7 +66,7 @@ bool GUI::Initialize(const std::string& title, int width, int height) {
 
     m_window = glfwCreateWindow(width, height, title.c_str(), nullptr, nullptr);
     if (!m_window) {
-        std::cerr << "[GUI] Failed to create GLFW window" << std::endl;
+        LOG_ERROR("[GUI] Failed to create GLFW window");
         glfwTerminate();
         return false;
     }
@@ -103,8 +104,7 @@ bool GUI::Initialize(const std::string& title, int width, int height) {
     m_running = true;
     m_lastFrameTime = std::chrono::steady_clock::now();
 
-    std::cout << "[GUI] Initialized — " << width << "x" << height
-              << " (INSERT to toggle)" << std::endl;
+    LOG_INFO("[GUI] Initialized — %dx%d (INSERT to toggle)", width, height);
     return true;
 }
 
@@ -122,7 +122,7 @@ void GUI::Shutdown() {
     m_window = nullptr;
     m_running = false;
 
-    std::cout << "[GUI] Shut down" << std::endl;
+    LOG_INFO("[GUI] Shut down");
 }
 
 // ============================================================
@@ -145,7 +145,7 @@ void GUI::Run() {
             bool pressed = glfwGetKey(m_window, m_toggleHotkey) == GLFW_PRESS;
             if (pressed && !m_hotkeyWasPressed) {
                 m_visible = !m_visible;
-                std::cout << "[GUI] " << (m_visible ? "Shown" : "Hidden") << std::endl;
+                LOG_INFO("[GUI] %s", m_visible ? "Shown" : "Hidden");
             }
             m_hotkeyWasPressed = pressed;
         }
@@ -714,13 +714,11 @@ void GUI::RenderConsoleTab() {
 
     ImGui::SameLine();
     if (ImGui::Button("Clear Output", ImVec2(120, 25))) {
-        m_logLines.clear();
+        // Ring buffer clears on its own — nothing to flush
     }
 
     ImGui::SameLine();
     if (ImGui::Button("Load Script...", ImVec2(120, 25))) {
-        // In a real app this would open a file dialog
-        // For now, try loading scripts/universal_hub.lua
         LuaBridge::GetInstance().ExecuteFile("scripts/universal_hub.lua");
     }
 
@@ -729,36 +727,41 @@ void GUI::RenderConsoleTab() {
 
     ImGui::Separator();
 
-    // ---- Console log output ----
+    // ---- Console log output (reads from Logger ring buffer) ----
     ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Output");
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Clear")) {
-        m_logLines.clear();
-    }
 
     ImGui::BeginChild("ConsoleOutput", ImVec2(0, 0), true);
 
-    for (const auto& line : m_logLines) {
-        ImVec4 color(1.0f, 1.0f, 1.0f, 1.0f);
+    static bool s_consoleAutoScroll = true;
+    auto entries = Logging::Logger::GetInstance().GetEntries(200);
+    for (const auto& entry : entries) {
+        // Format: [HH:MM:SS.mmm] [LEVEL] message
+        auto tt = std::chrono::system_clock::to_time_t(entry.timestamp);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            entry.timestamp.time_since_epoch()) % 1000;
+        char timeBuf[16];
+        std::tm tm{};
+        localtime_s(&tm, &tt);
+        strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S", &tm);
 
-        // Color-code lines
-        if (line.find("[ERROR]") != std::string::npos) {
-            color = ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
-        } else if (line.find("[WARN]") != std::string::npos) {
-            color = ImVec4(1.0f, 0.8f, 0.3f, 1.0f);
-        } else if (line.find("[OK]") != std::string::npos ||
-                   line.find("success") != std::string::npos) {
-            color = ImVec4(0.3f, 1.0f, 0.3f, 1.0f);
-        } else if (line.find(">") == 0) {
-            color = ImVec4(0.5f, 0.7f, 1.0f, 1.0f);
+        ImVec4 color(1.0f, 1.0f, 1.0f, 1.0f);
+        switch (entry.level) {
+            case Logging::LogLevel::Trace: color = ImVec4(0.5f, 0.5f, 0.5f, 1.0f); break;
+            case Logging::LogLevel::Debug: color = ImVec4(0.4f, 0.8f, 1.0f, 1.0f); break;
+            case Logging::LogLevel::Info:  color = ImVec4(1.0f, 1.0f, 1.0f, 1.0f); break;
+            case Logging::LogLevel::Warn:  color = ImVec4(1.0f, 0.8f, 0.3f, 1.0f); break;
+            case Logging::LogLevel::Error: color = ImVec4(1.0f, 0.3f, 0.3f, 1.0f); break;
+            case Logging::LogLevel::Fatal: color = ImVec4(1.0f, 0.0f, 0.0f, 1.0f); break;
         }
 
-        ImGui::TextColored(color, "%s", line.c_str());
+        ImGui::TextColored(color, "[%s.%03lld] [%s] %s",
+                           timeBuf, ms.count(),
+                           Logging::LogLevelToString(entry.level),
+                           entry.message.c_str());
     }
 
-    if (m_scrollToBottom) {
+    if (s_consoleAutoScroll) {
         ImGui::SetScrollHereY(1.0f);
-        m_scrollToBottom = false;
     }
 
     ImGui::EndChild();
@@ -770,23 +773,21 @@ void GUI::ExecuteLuaInput() {
     std::string code(m_luaInputBuffer);
     if (code.empty()) return;
 
-    // Echo to console
-    m_logLines.push_back("> " + code);
+    // Echo to console via Logger
+    LOG_INFO("> %s", code.c_str());
     m_consoleHistory.push_back(code);
     m_historyPos = -1;
 
     // Execute
     auto& bridge = LuaBridge::GetInstance();
     if (bridge.ExecuteString(code)) {
-        m_logLines.push_back("[OK] Executed successfully");
+        LOG_INFO("[LuaConsole] Executed successfully");
     } else {
-        m_logLines.push_back("[ERROR] Execution failed");
+        LOG_ERROR("[LuaConsole] Execution failed");
     }
 
     // Cleanup
     std::memset(m_luaInputBuffer, 0, sizeof(m_luaInputBuffer));
-    m_scrollToBottom = true;
-    m_reclaimFocus = true;
 }
 
 // ============================================================
@@ -797,41 +798,60 @@ void GUI::RenderLogPanel() {
     ImGui::Begin("Log");
 
     ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Event Log");
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Clear")) {
-        m_logLines.clear();
-    }
 
     ImGui::Separator();
 
     ImGui::BeginChild("LogScroll", ImVec2(0, 0), true);
 
-    // Show log lines with filtering
-    static bool showErrors = true;
-    static bool showWarnings = true;
+    // Filter checkboxes by log level
+    static bool showTrace = false;
+    static bool showDebug = true;
     static bool showInfo = true;
+    static bool showWarn = true;
+    static bool showError = true;
+    static bool showFatal = true;
 
-    ImGui::Checkbox("Errors", &showErrors);
+    ImGui::Checkbox("Trace", &showTrace);
     ImGui::SameLine();
-    ImGui::Checkbox("Warnings", &showWarnings);
+    ImGui::Checkbox("Debug", &showDebug);
     ImGui::SameLine();
     ImGui::Checkbox("Info", &showInfo);
+    ImGui::SameLine();
+    ImGui::Checkbox("Warn", &showWarn);
+    ImGui::SameLine();
+    ImGui::Checkbox("Error", &showError);
+    ImGui::SameLine();
+    ImGui::Checkbox("Fatal", &showFatal);
 
     ImGui::Separator();
 
-    for (const auto& line : m_logLines) {
-        bool isError = line.find("[ERROR]") != std::string::npos;
-        bool isWarning = line.find("[WARN]") != std::string::npos;
-
-        if (isError && !showErrors) continue;
-        if (isWarning && !showWarnings) continue;
-        if (!isError && !isWarning && !showInfo) continue;
+    auto entries = Logging::Logger::GetInstance().GetEntries(200);
+    for (const auto& entry : entries) {
+        // Filter by level
+        bool show = false;
+        switch (entry.level) {
+            case Logging::LogLevel::Trace: show = showTrace; break;
+            case Logging::LogLevel::Debug: show = showDebug; break;
+            case Logging::LogLevel::Info:  show = showInfo;  break;
+            case Logging::LogLevel::Warn:  show = showWarn;  break;
+            case Logging::LogLevel::Error: show = showError; break;
+            case Logging::LogLevel::Fatal: show = showFatal; break;
+        }
+        if (!show) continue;
 
         ImVec4 color(1.0f, 1.0f, 1.0f, 1.0f);
-        if (isError) color = ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
-        else if (isWarning) color = ImVec4(1.0f, 0.8f, 0.3f, 1.0f);
+        switch (entry.level) {
+            case Logging::LogLevel::Trace: color = ImVec4(0.5f, 0.5f, 0.5f, 1.0f); break;
+            case Logging::LogLevel::Debug: color = ImVec4(0.4f, 0.8f, 1.0f, 1.0f); break;
+            case Logging::LogLevel::Info:  color = ImVec4(1.0f, 1.0f, 1.0f, 1.0f); break;
+            case Logging::LogLevel::Warn:  color = ImVec4(1.0f, 0.8f, 0.3f, 1.0f); break;
+            case Logging::LogLevel::Error: color = ImVec4(1.0f, 0.3f, 0.3f, 1.0f); break;
+            case Logging::LogLevel::Fatal: color = ImVec4(1.0f, 0.0f, 0.0f, 1.0f); break;
+        }
 
-        ImGui::TextColored(color, "%s", line.c_str());
+        ImGui::TextColored(color, "[%s] %s",
+                           Logging::LogLevelToString(entry.level),
+                           entry.message.c_str());
     }
 
     ImGui::EndChild();
@@ -852,16 +872,16 @@ void GUI::ProcessWidgetQueue() {
     for (const auto& w : widgets) {
         switch (w.type) {
             case GuiWidget::Type::Log: {
-                m_logLines.push_back(w.text);
-                m_scrollToBottom = true;
+                LOG_INFO("%s", w.text.c_str());
+
                 break;
             }
 
             case GuiWidget::Type::Text: {
                 // Text widgets are rendered inline in their tab
                 // For now, add to log
-                m_logLines.push_back("[TEXT] " + w.tabName + ": " + w.text);
-                m_scrollToBottom = true;
+                LOG_DEBUG("[TEXT] %s: %s", w.tabName.c_str(), w.text.c_str());
+
                 break;
             }
 
@@ -917,12 +937,12 @@ void GUI::SaveConfig() {
         if (file.is_open()) {
             file << config.dump(2);
             file.close();
-            m_logLines.push_back("[OK] Config saved to config/user_config.json");
+            LOG_INFO("[OK] Config saved to config/user_config.json");
         }
     } catch (const std::exception& e) {
-        m_logLines.push_back("[ERROR] Failed to save config: " + std::string(e.what()));
+        LOG_ERROR("[ERROR] Failed to save config: %s", e.what());
     }
-    m_scrollToBottom = true;
+
 }
 
 void GUI::LoadConfig() {
@@ -944,9 +964,9 @@ void GUI::LoadConfig() {
                 m_toggleHotkey = config["gui"]["toggle_hotkey"];
         }
 
-        m_logLines.push_back("[OK] Config loaded from config/user_config.json");
+        LOG_INFO("[OK] Config loaded from config/user_config.json");
     } catch (const std::exception& e) {
-        m_logLines.push_back("[WARN] Failed to load config: " + std::string(e.what()));
+        LOG_WARN("[WARN] Failed to load config: %s", e.what());
     }
-    m_scrollToBottom = true;
+
 }

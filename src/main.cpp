@@ -5,50 +5,58 @@
  * Attaches to a target process to demonstrate memory I/O, LuaU scripting,
  * and modular GUI-based automation control.
  *
+ * Initialization order:
+ *   1. Logger     — structured logging to file, GUI ring buffer, debug output
+ *   2. CrashHandler — SEH/C++/signal handlers for crash diagnostics
+ *   3. Engine     — optional auto-attach via --attach flag
+ *
  * FOR EDUCATIONAL DEMONSTRATION ONLY — intended for use with test.exe
  * in a controlled offline environment.
  */
 
-#include <iostream>
 #include <string>
+#include "Logging/Logger.h"
+#include "Logging/CrashHandler.h"
 #include "Core/Engine.h"
 #include "Core/Memory.h"
 #include "Core/Bootstrap.h"
 
 void PrintUsage() {
-    std::cout << "\n";
-    std::cout << "  Universal Hub — Automation Dashboard\n";
-    std::cout << "  ======================================\n\n";
-    std::cout << "  Commands:\n";
-    std::cout << "    attach <process>   Attach to a process by name or PID\n";
-    std::cout << "    detach             Detach from current process\n";
-    std::cout << "    read <addr> <type> Read memory (type: i32, f32, u8, str)\n";
-    std::cout << "    write <addr> <val> Write memory (same types as read)\n";
-    std::cout << "    module <name>      Get base address of a module\n";
-    std::cout << "    bootstrap <dll>    Load DLL into target (educational demo)\n";
-    std::cout << "    gui                Launch the GUI control panel\n";
-    std::cout << "    help               Show this help\n";
-    std::cout << "    exit               Quit\n\n";
+    // PrintUsage still uses stdout directly since it's the interactive help text
+    // and not a log event per se. The banner and CLI output go through Logger.
+    printf("\n");
+    printf("  Universal Hub — Automation Dashboard\n");
+    printf("  ======================================\n\n");
+    printf("  Commands:\n");
+    printf("    attach <process>   Attach to a process by name or PID\n");
+    printf("    detach             Detach from current process\n");
+    printf("    read <addr> <type> Read memory (type: i32, f32, u8, str)\n");
+    printf("    write <addr> <val> Write memory (same types as read)\n");
+    printf("    module <name>      Get base address of a module\n");
+    printf("    bootstrap <dll>    Load DLL into target (educational demo)\n");
+    printf("    gui                Launch the GUI control panel\n");
+    printf("    help               Show this help\n");
+    printf("    exit               Quit\n\n");
 }
 
-/**
- * Phase 1 demonstration: attach to a target process and perform basic
- * memory read/write operations from the console.
- *
- * In Phase 3+, this will be replaced by the Dear ImGui GUI loop.
- */
 int main(int argc, char* argv[]) {
-    std::cout << "Universal Hub v1.0.0 — Automation Framework\n";
-    std::cout << "FOR EDUCATIONAL DEMONSTRATION ONLY\n\n";
+    // ---- Phase 7: Initialize logging & crash handling first ----
+    Logging::Logger::GetInstance().Initialize();
+    Logging::CrashHandler::GetInstance().Install();
+
+    LOG_INFO("Universal Hub v1.0.0 — Automation Framework");
+    LOG_INFO("FOR EDUCATIONAL DEMONSTRATION ONLY");
 
     // If command-line PID provided, attach immediately
     if (argc >= 3 && std::string(argv[1]) == "--attach") {
         DWORD pid = std::stoul(argv[2]);
         if (!Engine::GetInstance().AttachToProcess(pid)) {
-            std::cerr << "Failed to attach. Try running as Administrator." << std::endl;
+            LOG_ERROR("Failed to attach to PID %lu. Try running as Administrator.", pid);
+            Logging::CrashHandler::GetInstance().Uninstall();
+            Logging::Logger::GetInstance().Shutdown();
             return 1;
         }
-        std::cout << "Successfully attached to PID " << pid << std::endl;
+        LOG_INFO("Successfully attached to PID %lu", pid);
     }
 
     PrintUsage();
@@ -73,7 +81,7 @@ int main(int argc, char* argv[]) {
         }
         else if (cmd == "attach") {
             if (args.empty()) {
-                std::cerr << "Usage: attach <process_name or PID>" << std::endl;
+                LOG_WARN("Usage: attach <process_name or PID>");
                 continue;
             }
             // Try numeric PID first, then process name
@@ -91,7 +99,7 @@ int main(int argc, char* argv[]) {
             // Parse: read <address> <type>
             size_t sp2 = args.find(' ');
             if (sp2 == std::string::npos) {
-                std::cerr << "Usage: read <hex_address> <type>" << std::endl;
+                LOG_WARN("Usage: read <hex_address> <type>");
                 continue;
             }
             try {
@@ -100,37 +108,32 @@ int main(int argc, char* argv[]) {
 
                 if (type == "i32" || type == "int32") {
                     int32_t v = Memory::Read<int32_t>(addr);
-                    std::cout << "  [0x" << std::hex << addr << std::dec
-                              << "] int32 = " << v << std::endl;
+                    LOG_INFO("Read [0x%llX] int32 = %d", addr, v);
                 }
                 else if (type == "f32" || type == "float") {
                     float v = Memory::Read<float>(addr);
-                    std::cout << "  [0x" << std::hex << addr << std::dec
-                              << "] float = " << v << std::endl;
+                    LOG_INFO("Read [0x%llX] float = %.3f", addr, v);
                 }
                 else if (type == "u8" || type == "uint8") {
                     int v = static_cast<int>(Memory::Read<uint8_t>(addr));
-                    std::cout << "  [0x" << std::hex << addr << std::dec
-                              << "] uint8 = " << v << std::endl;
+                    LOG_INFO("Read [0x%llX] uint8 = %d", addr, v);
                 }
                 else if (type == "str" || type == "string") {
                     std::string s = Memory::ReadString(addr);
-                    std::cout << "  [0x" << std::hex << addr << std::dec
-                              << "] string = \"" << s << "\"" << std::endl;
+                    LOG_INFO("Read [0x%llX] string = \"%s\"", addr, s.c_str());
                 }
                 else {
-                    std::cerr << "Unknown type: " << type
-                              << " (use: i32, f32, u8, str)" << std::endl;
+                    LOG_WARN("Unknown type: %s (use: i32, f32, u8, str)", type.c_str());
                 }
             } catch (const std::exception& e) {
-                std::cerr << "Error: " << e.what() << std::endl;
+                LOG_ERROR("Read failed: %s", e.what());
             }
         }
         else if (cmd == "write") {
             // Parse: write <address> <value> [type]
             size_t sp2 = args.find(' ');
             if (sp2 == std::string::npos) {
-                std::cerr << "Usage: write <hex_address> <value> [type=f32]" << std::endl;
+                LOG_WARN("Usage: write <hex_address> <value> [type=f32]");
                 continue;
             }
             size_t sp3 = args.find(' ', sp2 + 1);
@@ -151,40 +154,46 @@ int main(int argc, char* argv[]) {
                     Memory::Write<int64_t>(addr, std::stoll(valStr));
                 }
 
-                std::cout << "  Wrote " << valStr << " (" << type
-                          << ") to 0x" << std::hex << addr << std::dec << std::endl;
+                LOG_INFO("Wrote %s (%s) to 0x%llX", valStr.c_str(), type.c_str(), addr);
             } catch (const std::exception& e) {
-                std::cerr << "Error: " << e.what() << std::endl;
+                LOG_ERROR("Write failed: %s", e.what());
             }
         }
         else if (cmd == "module") {
             if (args.empty()) {
-                std::cerr << "Usage: module <name> (e.g., test.exe)" << std::endl;
+                LOG_WARN("Usage: module <name> (e.g., test.exe)");
                 continue;
             }
             uintptr_t base = Memory::GetModuleBaseAddress(args);
             if (base) {
-                std::cout << "  " << args << " base: 0x"
-                          << std::hex << base << std::dec << std::endl;
+                LOG_INFO("%s base: 0x%llX", args.c_str(), base);
             } else {
-                std::cout << "  Module '" << args << "' not found" << std::endl;
+                LOG_INFO("Module '%s' not found", args.c_str());
             }
         }
         else if (cmd == "bootstrap") {
             if (args.empty()) {
-                std::cerr << "Usage: bootstrap <dll_path>" << std::endl;
+                LOG_WARN("Usage: bootstrap <dll_path>");
                 continue;
             }
-            std::cout << "  FOR EDUCATIONAL DEMONSTRATION ONLY" << std::endl;
+            LOG_INFO("FOR EDUCATIONAL DEMONSTRATION ONLY");
             Bootstrap::LoadIntoProcess(args);
         }
         else if (cmd == "gui") {
-            std::cout << "  GUI mode will be available in Phase 3" << std::endl;
+            LOG_INFO("GUI mode will be available in Phase 3");
+        }
+        else if (cmd == "crash") {
+            // Hidden command: test crash handler
+            LOG_INFO("Triggering test crash in 1 second...");
+            Logging::CrashHandler::GetInstance().TriggerCrash("Test crash from console");
         }
         else {
-            std::cerr << "Unknown command: " << cmd << " (type 'help')" << std::endl;
+            LOG_WARN("Unknown command: %s (type 'help')", cmd.c_str());
         }
     }
 
+    // ---- Clean shutdown ----
+    Logging::CrashHandler::GetInstance().Uninstall();
+    Logging::Logger::GetInstance().Shutdown();
     return 0;
 }

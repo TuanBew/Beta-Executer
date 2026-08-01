@@ -1,5 +1,5 @@
 #include "Engine.h"
-#include <iostream>
+#include "Logging/Logger.h"
 
 // ---- Singleton Access ----
 
@@ -24,7 +24,7 @@ bool Engine::AttachToProcess(const std::string& processName) {
 
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnapshot == INVALID_HANDLE_VALUE) {
-        std::cerr << "[Engine] Failed to create process snapshot" << std::endl;
+        LOG_ERROR("[Engine] Failed to create process snapshot");
         return false;
     }
 
@@ -43,7 +43,7 @@ bool Engine::AttachToProcess(const std::string& processName) {
     CloseHandle(hSnapshot);
 
     if (pid == 0) {
-        std::cerr << "[Engine] Process '" << processName << "' not found" << std::endl;
+        LOG_ERROR("[Engine] Process '%s' not found", processName.c_str());
         return false;
     }
 
@@ -62,17 +62,15 @@ bool Engine::AttachToProcess(DWORD pid) {
     // controlled offline environment.
     m_hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if (!m_hProcess) {
-        std::cerr << "[Engine] OpenProcess failed for PID " << pid
-                  << " (error: " << GetLastError()
-                  << "). Try running as Administrator." << std::endl;
+        LOG_ERROR("[Engine] OpenProcess failed for PID %lu (error: %lu). Try running as Administrator.",
+                  pid, GetLastError());
         return false;
     }
 
     m_Pid = pid;
     ResolveModuleBase();
 
-    std::cout << "[Engine] Attached to process '" << m_Pid
-              << "' base: 0x" << std::hex << m_ModuleBase << std::dec << std::endl;
+    LOG_INFO("[Engine] Attached to process PID %lu, base: 0x%llX", m_Pid, m_ModuleBase);
     return true;
 }
 
@@ -82,7 +80,7 @@ void Engine::Detach() {
     if (m_hProcess) {
         CloseHandle(m_hProcess);
         m_hProcess = nullptr;
-        std::cout << "[Engine] Detached from process " << m_Pid << std::endl;
+        LOG_INFO("[Engine] Detached from process PID %lu", m_Pid);
     }
     m_Pid = 0;
     m_ModuleBase = 0;

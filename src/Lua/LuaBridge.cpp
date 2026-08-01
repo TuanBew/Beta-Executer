@@ -13,7 +13,7 @@
 
 #include "LuaBridge.h"
 
-#include <iostream>
+#include "Logging/Logger.h"
 #include <fstream>
 #include <sstream>
 #include <cstring>
@@ -65,6 +65,10 @@ static int l_json_encode(lua_State* L);
 // Utility
 static int l_get_module_base(lua_State* L);
 
+// Logging
+static int l_log(lua_State* L);
+static int l_print_bridge(lua_State* L);
+
 // ---- Table of Bridge Functions to Register ----
 
 static const luaL_Reg kBridgeFunctions[] = {
@@ -101,6 +105,10 @@ static const luaL_Reg kBridgeFunctions[] = {
 
     // Utility
     {"get_module_base",     l_get_module_base},
+
+    // Logging
+    {"log",                 l_log},
+    {"print",               l_print_bridge},  // Override Lua print()
 
     {nullptr, nullptr}
 };
@@ -159,7 +167,7 @@ bool LuaBridge::Initialize() {
     // Create a new LuaU VM
     L = luaL_newstate();
     if (!L) {
-        std::cerr << "[LuaBridge] Failed to create lua_State" << std::endl;
+        LOG_ERROR("[LuaBridge] Failed to create lua_State");
         return false;
     }
 
@@ -172,7 +180,7 @@ bool LuaBridge::Initialize() {
     // Register all bridge functions as globals
     RegisterBridgeFunctions();
 
-    std::cout << "[LuaBridge] LuaU VM initialized successfully" << std::endl;
+    LOG_INFO("[LuaBridge] LuaU VM initialized successfully");
     return true;
 }
 
@@ -182,7 +190,7 @@ void LuaBridge::Shutdown() {
         L = nullptr;
         m_intercepts.clear();
         m_widgetQueue.clear();
-        std::cout << "[LuaBridge] LuaU VM shut down" << std::endl;
+        LOG_INFO("[LuaBridge] LuaU VM shut down");
     }
 }
 
@@ -286,7 +294,7 @@ void LuaBridge::RegisterBridgeFunctions() {
 
 bool LuaBridge::ExecuteString(const std::string& code) {
     if (!L) {
-        std::cerr << "[LuaBridge] VM not initialized" << std::endl;
+        LOG_ERROR("[LuaBridge] VM not initialized");
         return false;
     }
 
@@ -295,7 +303,7 @@ bool LuaBridge::ExecuteString(const std::string& code) {
     char* bytecode = luau_compile(code.data(), code.size(), nullptr, &bytecodeSize);
 
     if (!bytecode) {
-        std::cerr << "[LuaBridge] Compilation failed" << std::endl;
+        LOG_ERROR("[LuaBridge] Compilation failed");
         return false;
     }
 
@@ -325,7 +333,7 @@ bool LuaBridge::ExecuteString(const std::string& code) {
 bool LuaBridge::ExecuteFile(const std::string& path) {
     std::ifstream file(path);
     if (!file.is_open()) {
-        std::cerr << "[LuaBridge] Cannot open file: " << path << std::endl;
+        LOG_ERROR("[LuaBridge] Cannot open file: %s", path.c_str());
         return false;
     }
 
@@ -339,7 +347,7 @@ bool LuaBridge::ExecuteFile(const std::string& path) {
     // but with the file path embedded in the compiled chunk name
 
     if (!L) {
-        std::cerr << "[LuaBridge] VM not initialized" << std::endl;
+        LOG_ERROR("[LuaBridge] VM not initialized");
         return false;
     }
 
@@ -347,7 +355,7 @@ bool LuaBridge::ExecuteFile(const std::string& path) {
     char* bytecode = luau_compile(code.data(), code.size(), nullptr, &bytecodeSize);
 
     if (!bytecode) {
-        std::cerr << "[LuaBridge] Compilation failed for: " << path << std::endl;
+        LOG_ERROR("[LuaBridge] Compilation failed for: %s", path.c_str());
         return false;
     }
 
@@ -368,7 +376,7 @@ bool LuaBridge::ExecuteFile(const std::string& path) {
         return false;
     }
 
-    std::cout << "[LuaBridge] Executed script: " << path << std::endl;
+    LOG_INFO("[LuaBridge] Executed script: %s", path.c_str());
     return true;
 }
 
@@ -384,7 +392,7 @@ void LuaBridge::OnFrame() {
     if (lua_isfunction(L, -1)) {
         if (lua_pcall(L, 0, 0, 0) != 0) {
             const char* err = lua_tostring(L, -1);
-            std::cerr << "[LuaBridge] on_frame error: " << (err ? err : "unknown") << std::endl;
+            LOG_ERROR("[LuaBridge] on_frame error: %s", err ? err : "unknown");
             lua_pop(L, 1);
         }
     } else {
@@ -438,7 +446,7 @@ lua_State* LuaBridge::GetState() const {
 
 void LuaBridge::ReportError(const std::string& context) {
     m_lastError = context;
-    std::cerr << "[LuaBridge] " << context << std::endl;
+    LOG_ERROR("[LuaBridge] %s", context.c_str());
 }
 
 // ============================================================
@@ -1015,6 +1023,72 @@ static int l_gui_log(lua_State* L) {
     widget.text = message;
 
     LuaBridge::GetInstance().QueueWidget(widget);
+    return 0;
+}
+
+/**
+ * log(level, message, ...)
+ *
+ * Structured logging from Lua — routes through Logger.
+ * level: "trace", "debug", "info", "warn", "error", "fatal"
+ * message: printf-style format string
+ */
+static int l_log(lua_State* L) {
+    const char* levelStr = luaL_checkstring(L, 1);
+    const char* message = luaL_checkstring(L, 2);
+
+    // Resolve level string to LogLevel
+    Logging::LogLevel level = Logging::LogLevel::Info;
+    if (strcmp(levelStr, "trace") == 0)      level = Logging::LogLevel::Trace;
+    else if (strcmp(levelStr, "debug") == 0) level = Logging::LogLevel::Debug;
+    else if (strcmp(levelStr, "info") == 0)  level = Logging::LogLevel::Info;
+    else if (strcmp(levelStr, "warn") == 0)  level = Logging::LogLevel::Warn;
+    else if (strcmp(levelStr, "error") == 0) level = Logging::LogLevel::Error;
+    else if (strcmp(levelStr, "fatal") == 0) level = Logging::LogLevel::Fatal;
+
+    // Format additional arguments
+    int nargs = lua_gettop(L);
+    if (nargs > 2) {
+        // Build formatted message with additional args
+        std::string formatted = message;
+        for (int i = 3; i <= nargs; ++i) {
+            const char* arg = lua_tostring(L, i);
+            formatted += " " + std::string(arg ? arg : "nil");
+        }
+        Logging::Logger::GetInstance().Log(level, "lua", 0, "script",
+                                           "%s", formatted.c_str());
+    } else {
+        Logging::Logger::GetInstance().Log(level, "lua", 0, "script",
+                                           "%s", message);
+    }
+    return 0;
+}
+
+/**
+ * print(...) — Lua print() override
+ *
+ * Redirects Lua's built-in print() through the Logger as LOG_INFO.
+ * Also displays in the GUI console via gui_log.
+ */
+static int l_print_bridge(lua_State* L) {
+    int nargs = lua_gettop(L);
+    std::string combined;
+
+    for (int i = 1; i <= nargs; ++i) {
+        if (i > 1) combined += "\t";
+        const char* s = lua_tostring(L, i);
+        combined += s ? s : "nil";
+    }
+
+    // Route through Logger
+    LOG_INFO("[Lua] %s", combined.c_str());
+
+    // Also display in GUI console
+    GuiWidget widget{};
+    widget.type = GuiWidget::Type::Log;
+    widget.text = combined;
+    LuaBridge::GetInstance().QueueWidget(widget);
+
     return 0;
 }
 

@@ -22,6 +22,8 @@ add_executable(UniversalHub
     main.cpp
     Core/Engine.cpp
     Core/Bootstrap.cpp
+    Logging/Logger.cpp
+    Logging/CrashHandler.cpp
     Lua/LuaBridge.cpp
     GUI/GUI.cpp
 )
@@ -40,6 +42,7 @@ target_link_libraries(UniversalHub PRIVATE
     Luau.VM
     Luau.Compiler
     Luau.Config
+    dbghelp
 )
 
 # Copy scripts and config to build directory

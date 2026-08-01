@@ -27,5 +27,13 @@
         "enabled": false,
         "log_incoming": true,
         "log_outgoing": true
+    },
+    "logging": {
+        "level": "debug",
+        "file_enabled": true,
+        "max_file_size_mb": 10,
+        "max_files": 5,
+        "gui_buffer_size": 500,
+        "debug_output": true
     }
 }
