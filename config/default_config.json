@@ -1,0 +1,31 @@
+{
+    "version": "1.0.0",
+    "general": {
+        "auto_attach": true,
+        "target_process": "test.exe",
+        "hotkey_toggle": 45
+    },
+    "visuals": {
+        "highlight_enabled": false,
+        "highlight_color": [0.0, 1.0, 0.0],
+        "highlight_radius": 30.0
+    },
+    "movement": {
+        "walk_speed": 16.0,
+        "jump_power": 50.0,
+        "hip_height": 0.0
+    },
+    "camera": {
+        "fov": 70.0
+    },
+    "environment": {
+        "gravity": 196.2,
+        "brightness": 2.0,
+        "clock_time": 14.0
+    },
+    "communication_logger": {
+        "enabled": false,
+        "log_incoming": true,
+        "log_outgoing": true
+    }
+}

@@ -1,0 +1,37 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# IDE files
+.idea/
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Binary artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+*.lib
+*.a
+*.exp
+*.pdb
+*.ilk
+
+# Secrets (contains API keys)
+api.txt
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Config state (not defaults)
+universal_hub_config.json
+
+# Runtime logs and crash dumps
+logs/
+*.dmp
