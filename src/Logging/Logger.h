@@ -121,6 +121,9 @@ public:
     std::string GetRecentLogs(size_t count = 20) const;
 
 private:
+    // Allow GuiSink to write directly into the lock-free ring buffer
+    friend class GuiSink;
+
     Logger() = default;
     ~Logger();
     Logger(const Logger&) = delete;

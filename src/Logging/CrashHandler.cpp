@@ -19,6 +19,8 @@
 #include <cstdio>
 #include <ctime>
 #include <csignal>
+#include <io.h>
+#include <fcntl.h>
 #include <dbghelp.h>
 
 #ifndef WIN32_LEAN_AND_MEAN
