@@ -1,5 +1,6 @@
 #include "Engine.h"
 #include "Logging/Logger.h"
+#include "Core/PrivilegeElevation.h"
 
 // ---- Singleton Access ----
 
@@ -70,6 +71,11 @@ bool Engine::AttachToProcess(DWORD pid) {
     m_Pid = pid;
     ResolveModuleBase();
 
+    // Auto-elevate script execution identity tier in the target process.
+    // Configured via config/default_config.json (privilege section).
+    // Gracefully handles unresolved chains — logs and continues.
+    Privilege::AutoElevateOnAttach();
+
     LOG_INFO("[Engine] Attached to process PID %lu, base: 0x%llX", m_Pid, m_ModuleBase);
     return true;
 }
@@ -78,6 +84,8 @@ bool Engine::AttachToProcess(DWORD pid) {
 
 void Engine::Detach() {
     if (m_hProcess) {
+        // Restore any privilege elevation detour bytes before closing
+        Privilege::Cleanup();
         CloseHandle(m_hProcess);
         m_hProcess = nullptr;
         LOG_INFO("[Engine] Detached from process PID %lu", m_Pid);

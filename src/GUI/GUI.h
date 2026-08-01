@@ -7,11 +7,10 @@
  * color pickers, text, and log panels).
  *
  * Tabbed layout:
- *   - General      — Process info, attach/detach controls
+ *   - Injector     — Process attach/detach, bootstrap, privilege elevation
+ *   - Executer     — Lua script editor and execution output (IDE)
+ *   - Error Logger — Filtered event log with level checkboxes
  *   - Objects      — Object tree browser, communication object scanner
- *   - Visuals      — Toggles and parameters for visual overlays
- *   - Automation   — Movement, camera, environment sliders
- *   - Console      — Lua script editor and execution log
  *
  * FOR EDUCATIONAL DEMONSTRATION ONLY
  */
@@ -22,7 +21,6 @@
 #include <vector>
 #include <functional>
 #include <chrono>
-#include <unordered_map>
 
 // Forward declarations
 struct GLFWwindow;
@@ -94,12 +92,10 @@ private:
 
     // ---- Rendering helpers ----
     void RenderMenuBar();
-    void RenderGeneralTab();
+    void RenderInjectorTab();
     void RenderObjectsTab();
-    void RenderVisualsTab();
-    void RenderAutomationTab();
-    void RenderConsoleTab();
-    void RenderLogPanel();
+    void RenderExecuterTab();
+    void RenderErrorLoggerTab();
 
     // ---- Widget consumption ----
     void ProcessWidgetQueue();
@@ -121,12 +117,18 @@ private:
     bool m_showDemoWindow = false;
     bool m_showMetrics = false;
 
-    // ---- Console state ----
-    char m_luaInputBuffer[4096] = {};
+    // ---- Executer (Lua IDE) state ----
+    char m_luaInputBuffer[16384] = {};
     std::vector<std::string> m_consoleHistory;
     int m_historyPos = -1;
+    std::string m_scriptPath = "scripts/level_check.lua";
 
-    // ---- Tab state ----
+    // ---- Injector (privilege) state ----
+    int  m_privilegeTargetLevel = 8;
+    bool m_privilegeAutoElevate = true;
+    bool m_privilegeBypassChecks = true;
+
+    // ---- Objects tab state ----
     struct ObjectEntry {
         std::string name;
         std::string className;
@@ -141,21 +143,6 @@ private:
         uintptr_t address;
     };
     std::vector<RemoteEntry> m_cachedRemotes;
-
-    // ---- Slider state cache ----
-    // Persists slider values across frames (widgets are re-queued each frame)
-    struct SliderState {
-        float value = 0.0f;
-        int callbackRef = -1;
-    };
-    std::unordered_map<std::string, SliderState> m_sliderStates;
-
-    // ---- Checkbox state cache ----
-    struct CheckboxState {
-        bool checked = false;
-        int callbackRef = -1;
-    };
-    std::unordered_map<std::string, CheckboxState> m_checkboxStates;
 
     // ---- Timing ----
     std::chrono::steady_clock::time_point m_lastFrameTime;

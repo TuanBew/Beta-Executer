@@ -40,6 +40,18 @@ namespace SimOffsets {
     constexpr uintptr_t LocalPlayer    = 0x130;
     constexpr uintptr_t IsPlaying      = 0x140;
     constexpr uintptr_t ClassBase      = 0x1b0;
+
+    // ---- ScriptContext chain offsets (matching offsets.h) ----
+    // These are large absolute pointers from the module base
+    constexpr uintptr_t FakeDataModelPointer     = 0x7e26978;
+    constexpr uintptr_t FakeDataModelToDataModel = 0x1d0;
+    constexpr uintptr_t Workspace               = 0x160;
+    constexpr uintptr_t ScriptContext            = 0x440;
+    constexpr uintptr_t ScriptContextRequireBypass = 0x0;
+    constexpr uintptr_t ScriptContextIdentityLevel  = 0x2c0;
+    constexpr uintptr_t ScriptContextActiveScript   = 0x2b0;
+    constexpr uintptr_t ScriptContextIdentityCheckFn = 0x2d0;
+    constexpr uintptr_t ScriptIdentityLevel         = 0x1c8;
 }
 
 // Simulated object structure sizes
@@ -52,6 +64,11 @@ struct SimulatedRegion {
     uint8_t* base;
     size_t   totalSize;
     uintptr_t baseAddr;       // Virtual address of the block
+
+    // ScriptContext chain tracking (for privilege elevation heartbeat)
+    uintptr_t scBase = 0;
+    uintptr_t fakeDMPtrSlot = 0;
+    bool     fdmAllocated = false;
 };
 
 SimulatedRegion g_Region{};
@@ -189,6 +206,89 @@ void InitRegion() {
     WriteVal<float>(workspace - g_Region.baseAddr + SimOffsets::Gravity, 196.2f);
     WriteVal<float>(workspace - g_Region.baseAddr + SimOffsets::IsPlaying, 1.0f);
 
+    // ============================================================
+    //  ScriptContext Chain Simulation (for Privilege Elevation)
+    // ============================================================
+    // This mimics the target's internal DataModel → ScriptContext pointer
+    // chain so the Privilege Elevation module can resolve and manipulate it.
+
+    // --- Step 1: Create ScriptContext object ---
+    uintptr_t scBase = offset;
+    offset += 0x400;
+    // ScriptContextRequireBypass = 0 (off by default)
+    WriteVal<uint8_t>(scBase + SimOffsets::ScriptContextRequireBypass, 0);
+    // ScriptContextIdentityLevel = 1 (lowest privilege)
+    WriteVal<int>(scBase + SimOffsets::ScriptContextIdentityLevel, 1);
+    // ScriptContextActiveScript = 0 (no script running yet)
+    WriteVal<uintptr_t>(scBase + SimOffsets::ScriptContextActiveScript, 0);
+
+    // --- Step 2: Create identity-check function stub (Strategy 4 target) ---
+    // Allocate executable memory for the stub: mov eax, 1; ret
+    uint8_t* stubMem = static_cast<uint8_t*>(
+        VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    uintptr_t identityCheckFn = 0;
+    if (stubMem) {
+        // mov eax, 1; ret  = B8 01 00 00 00 C3
+        stubMem[0] = 0xB8;
+        stubMem[1] = 0x01; stubMem[2] = 0x00; stubMem[3] = 0x00; stubMem[4] = 0x00;
+        stubMem[5] = 0xC3;
+        identityCheckFn = reinterpret_cast<uintptr_t>(stubMem);
+        // Store function pointer in ScriptContext
+        WriteVal<uintptr_t>(scBase + SimOffsets::ScriptContextIdentityCheckFn, identityCheckFn);
+    }
+
+    // --- Step 3: Create DataModel object ---
+    uintptr_t dmBase = offset;
+    offset += 0x400;
+    // DataModel → ScriptContext pointer
+    WriteVal<uintptr_t>(dmBase + SimOffsets::ScriptContext, g_Region.baseAddr + scBase);
+    // DataModel → Workspace pointer
+    WriteVal<uintptr_t>(dmBase + SimOffsets::Workspace, workspace);
+    // DataModel → LocalPlayer pointer
+    WriteVal<uintptr_t>(dmBase + SimOffsets::LocalPlayer, player);
+
+    // --- Step 4: Create FakeDataModel object ---
+    uintptr_t fdmBase = offset;
+    offset += 0x200;
+    // FakeDataModel → DataModel pointer
+    WriteVal<uintptr_t>(fdmBase + SimOffsets::FakeDataModelToDataModel, g_Region.baseAddr + dmBase);
+
+    // --- Step 5: Place FakeDataModel pointer at moduleBase + offset ---
+    // The target uses a large absolute offset (0x7e26978) from the module base
+    // to store the FakeDataModel pointer. We need to allocate at that address.
+    HMODULE hMod = GetModuleHandleA(nullptr);
+    uintptr_t moduleBase = reinterpret_cast<uintptr_t>(hMod);
+    uintptr_t fakeDMPtrSlot = moduleBase + SimOffsets::FakeDataModelPointer;
+
+    // Try to allocate near the expected slot address
+    // We allocate a page at (slot - 0x1000) and write at the correct offset
+    uintptr_t allocHint = (fakeDMPtrSlot & ~0xFFF) - 0x1000;
+    LPVOID fdmSlotPage = VirtualAlloc(reinterpret_cast<LPVOID>(allocHint),
+                                       0x3000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (fdmSlotPage) {
+        uintptr_t* slot = reinterpret_cast<uintptr_t*>(fakeDMPtrSlot);
+        *slot = g_Region.baseAddr + fdmBase;
+        std::cout << "[Mock] FakeDataModel* placed @ 0x" << std::hex << fakeDMPtrSlot
+                  << " → 0x" << (g_Region.baseAddr + fdmBase) << std::dec << std::endl;
+    } else {
+        std::cout << "[Mock] WARNING: Could not allocate FakeDataModel pointer slot @ 0x"
+                  << std::hex << fakeDMPtrSlot << std::dec << std::endl;
+        std::cout << "[Mock] The privilege chain will not resolve — restart may help (ASLR)."
+                  << std::endl;
+    }
+
+    // Store addresses globally for the heartbeat
+    g_Region.scBase = scBase;
+    g_Region.fakeDMPtrSlot = fakeDMPtrSlot;
+    g_Region.fdmAllocated = (fdmSlotPage != nullptr);
+
+    std::cout << "[Mock] ScriptContext @ 0x" << std::hex << (g_Region.baseAddr + scBase)
+              << " (identity=" << 1 << ", bypass=0)" << std::dec << std::endl;
+    if (identityCheckFn) {
+        std::cout << "[Mock] Identity-check stub @ 0x" << std::hex << identityCheckFn
+                  << std::dec << " (Strategy 4 ready)" << std::endl;
+    }
+
     // ---- Summary ----
     std::cout << "[Mock] Created objects:\n";
     std::cout << "  Workspace  @ 0x" << std::hex << workspace      << std::dec << "\n";
@@ -229,13 +329,28 @@ int main() {
         std::memcpy(&ws,
                     g_Region.base + (playerAddr - g_Region.baseAddr) + SimOffsets::WalkSpeed,
                     sizeof(float));
-        std::cout << "[Mock] tick=" << tick << " WalkSpeed=" << ws
-                  << " FOV=";
         float fov = 0;
         std::memcpy(&fov,
                     g_Region.base + (playerAddr - g_Region.baseAddr) + SimOffsets::FOV,
                     sizeof(float));
-        std::cout << fov << std::endl;
+
+        std::cout << "[Mock] tick=" << tick << " WalkSpeed=" << ws << " FOV=" << fov;
+
+        // Show ScriptContext identity level (for privilege elevation)
+        if (g_Region.scBase != 0) {
+            int identity = 0;
+            std::memcpy(&identity,
+                        g_Region.base + g_Region.scBase + SimOffsets::ScriptContextIdentityLevel,
+                        sizeof(int));
+            uint8_t bypass = 0;
+            std::memcpy(&bypass,
+                        g_Region.base + g_Region.scBase + SimOffsets::ScriptContextRequireBypass,
+                        sizeof(uint8_t));
+            std::cout << " | ScriptCtx identity=" << identity
+                      << " bypass=" << (int)bypass;
+        }
+
+        std::cout << std::endl;
     }
 
     VirtualFree(g_Region.base, 0, MEM_RELEASE);

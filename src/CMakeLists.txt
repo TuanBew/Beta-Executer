@@ -22,6 +22,7 @@ add_executable(UniversalHub
     main.cpp
     Core/Engine.cpp
     Core/Bootstrap.cpp
+    Core/PrivilegeElevation.cpp
     Logging/Logger.cpp
     Logging/CrashHandler.cpp
     Lua/LuaBridge.cpp

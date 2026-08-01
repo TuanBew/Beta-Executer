@@ -5,75 +5,70 @@
  * Attaches to a target process to demonstrate memory I/O, LuaU scripting,
  * and modular GUI-based automation control.
  *
+ * Default mode launches the Dear ImGui control panel. Pass --console
+ * to use the legacy text-based REPL instead.
+ *
  * Initialization order:
- *   1. Logger     — structured logging to file, GUI ring buffer, debug output
- *   2. CrashHandler — SEH/C++/signal handlers for crash diagnostics
- *   3. Engine     — optional auto-attach via --attach flag
+ *   1. Logger        — structured logging to file, GUI ring buffer, debug output
+ *   2. CrashHandler  — SEH/C++/signal handlers for crash diagnostics
+ *   3. LuaBridge     — LuaU VM with sandbox + bridge functions
+ *   4. Engine        — optional auto-attach via --attach flag (triggers Privilege::AutoElevateOnAttach)
+ *   5. GUI           — GLFW window + ImGui docking (default) or console REPL (--console)
+ *
+ * Shutdown order (reverse):
+ *   LuaBridge → Engine → Privilege → CrashHandler → Logger
  *
  * FOR EDUCATIONAL DEMONSTRATION ONLY — intended for use with test.exe
  * in a controlled offline environment.
  */
 
 #include <string>
+#include <cstdlib>
+
 #include "Logging/Logger.h"
 #include "Logging/CrashHandler.h"
 #include "Core/Engine.h"
 #include "Core/Memory.h"
 #include "Core/Bootstrap.h"
+#include "Core/PrivilegeElevation.h"
+#include "Lua/LuaBridge.h"
+#include "GUI/GUI.h"
 
-void PrintUsage() {
-    // PrintUsage still uses stdout directly since it's the interactive help text
-    // and not a log event per se. The banner and CLI output go through Logger.
+static void PrintUsage() {
     printf("\n");
-    printf("  Universal Hub — Automation Dashboard\n");
+    printf("  Universal Hub — Automation Framework\n");
     printf("  ======================================\n\n");
-    printf("  Commands:\n");
+    printf("  Usage:\n");
+    printf("    UniversalHub.exe                     Launch GUI control panel (default)\n");
+    printf("    UniversalHub.exe --console           Launch text-based REPL\n");
+    printf("    UniversalHub.exe --attach <PID>      Auto-attach on startup\n\n");
+    printf("  Console Commands:\n");
     printf("    attach <process>   Attach to a process by name or PID\n");
     printf("    detach             Detach from current process\n");
     printf("    read <addr> <type> Read memory (type: i32, f32, u8, str)\n");
     printf("    write <addr> <val> Write memory (same types as read)\n");
     printf("    module <name>      Get base address of a module\n");
     printf("    bootstrap <dll>    Load DLL into target (educational demo)\n");
-    printf("    gui                Launch the GUI control panel\n");
     printf("    help               Show this help\n");
     printf("    exit               Quit\n\n");
 }
 
-int main(int argc, char* argv[]) {
-    // ---- Phase 7: Initialize logging & crash handling first ----
-    Logging::Logger::GetInstance().Initialize();
-    Logging::CrashHandler::GetInstance().Install();
+// ---- Legacy Console REPL ----
+// Extracted from the original main() body for the --console fallback path.
 
-    LOG_INFO("Universal Hub v1.0.0 — Automation Framework");
-    LOG_INFO("FOR EDUCATIONAL DEMONSTRATION ONLY");
-
-    // If command-line PID provided, attach immediately
-    if (argc >= 3 && std::string(argv[1]) == "--attach") {
-        DWORD pid = std::stoul(argv[2]);
-        if (!Engine::GetInstance().AttachToProcess(pid)) {
-            LOG_ERROR("Failed to attach to PID %lu. Try running as Administrator.", pid);
-            Logging::CrashHandler::GetInstance().Uninstall();
-            Logging::Logger::GetInstance().Shutdown();
-            return 1;
-        }
-        LOG_INFO("Successfully attached to PID %lu", pid);
-    }
-
+static void RunConsoleRepl() {
     PrintUsage();
 
-    // Interactive console loop (Phase 1 testing)
     std::string line;
     while (std::getline(std::cin, line)) {
         if (line.empty()) continue;
 
-        // Parse: command arg1 [arg2]
         size_t firstSpace = line.find(' ');
         std::string cmd = line.substr(0, firstSpace);
         std::string args = (firstSpace != std::string::npos)
             ? line.substr(firstSpace + 1) : "";
 
         if (cmd == "exit" || cmd == "quit") {
-            Engine::GetInstance().Detach();
             break;
         }
         else if (cmd == "help") {
@@ -84,7 +79,6 @@ int main(int argc, char* argv[]) {
                 LOG_WARN("Usage: attach <process_name or PID>");
                 continue;
             }
-            // Try numeric PID first, then process name
             try {
                 DWORD pid = std::stoul(args);
                 Engine::GetInstance().AttachToProcess(pid);
@@ -96,7 +90,6 @@ int main(int argc, char* argv[]) {
             Engine::GetInstance().Detach();
         }
         else if (cmd == "read") {
-            // Parse: read <address> <type>
             size_t sp2 = args.find(' ');
             if (sp2 == std::string::npos) {
                 LOG_WARN("Usage: read <hex_address> <type>");
@@ -130,7 +123,6 @@ int main(int argc, char* argv[]) {
             }
         }
         else if (cmd == "write") {
-            // Parse: write <address> <value> [type]
             size_t sp2 = args.find(' ');
             if (sp2 == std::string::npos) {
                 LOG_WARN("Usage: write <hex_address> <value> [type=f32]");
@@ -179,11 +171,7 @@ int main(int argc, char* argv[]) {
             LOG_INFO("FOR EDUCATIONAL DEMONSTRATION ONLY");
             Bootstrap::LoadIntoProcess(args);
         }
-        else if (cmd == "gui") {
-            LOG_INFO("GUI mode will be available in Phase 3");
-        }
         else if (cmd == "crash") {
-            // Hidden command: test crash handler
             LOG_INFO("Triggering test crash in 1 second...");
             Logging::CrashHandler::GetInstance().TriggerCrash("Test crash from console");
         }
@@ -191,9 +179,69 @@ int main(int argc, char* argv[]) {
             LOG_WARN("Unknown command: %s (type 'help')", cmd.c_str());
         }
     }
+}
 
-    // ---- Clean shutdown ----
+// ---- Main ----
+
+int main(int argc, char* argv[]) {
+    // ---- 1. Logger ----
+    Logging::Logger::GetInstance().Initialize();
+
+    // ---- 2. CrashHandler ----
+    Logging::CrashHandler::GetInstance().Install();
+
+    LOG_INFO("Universal Hub v1.0.0 — Automation Framework");
+    LOG_INFO("FOR EDUCATIONAL DEMONSTRATION ONLY");
+
+    // ---- 3. LuaBridge (LuaU VM + sandbox + bridges) ----
+    if (!LuaBridge::GetInstance().Initialize()) {
+        LOG_WARN("[Main] LuaBridge failed to initialize — scripting will be unavailable");
+    }
+
+    // ---- 4. Auto-attach via --attach flag ----
+    // Note: Engine::AttachToProcess now calls Privilege::AutoElevateOnAttach() internally.
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--attach" && i + 1 < argc) {
+            DWORD pid = std::stoul(argv[++i]);
+            if (Engine::GetInstance().AttachToProcess(pid)) {
+                LOG_INFO("Successfully attached to PID %lu", pid);
+            } else {
+                LOG_ERROR("Failed to attach to PID %lu. Try running as Administrator.", pid);
+            }
+        }
+    }
+
+    // ---- Determine mode: GUI (default) or console (--console flag) ----
+    bool useConsole = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--console") {
+            useConsole = true;
+            break;
+        }
+    }
+
+    if (useConsole) {
+        // ---- Legacy Console REPL ----
+        RunConsoleRepl();
+    } else {
+        // ---- GUI Mode (default) ----
+        if (GUI::GetInstance().Initialize("Universal Hub", 1280, 720)) {
+            LOG_INFO("[Main] Entering GUI mode — press INSERT to toggle visibility");
+            GUI::GetInstance().Run();
+        } else {
+            LOG_WARN("[Main] GUI initialization failed (headless or no GLFW?) — falling back to console REPL");
+            RunConsoleRepl();
+        }
+    }
+
+    // ---- Clean shutdown (reverse init order) ----
+    LOG_INFO("[Main] Shutting down...");
+
+    LuaBridge::GetInstance().Shutdown();
+    Engine::GetInstance().Detach();
+    Privilege::Cleanup();
     Logging::CrashHandler::GetInstance().Uninstall();
     Logging::Logger::GetInstance().Shutdown();
+
     return 0;
 }

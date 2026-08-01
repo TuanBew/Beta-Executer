@@ -294,6 +294,14 @@ namespace offsets {
     inline constexpr uintptr_t ScriptByteCode = 0x190;
     inline constexpr uintptr_t ScriptContext = 0x440;
     inline constexpr uintptr_t ScriptContextRequireBypass = 0x0;
+
+    // ---- ScriptContext internals (identity / privilege management) ----
+    // These offsets are relative to the ScriptContext object itself.
+    // PLACEHOLDER VALUES — must be verified against the real target structure.
+    inline constexpr uintptr_t ScriptContextIdentityLevel  = 0x2c0; // int: current script identity tier (1-10)
+    inline constexpr uintptr_t ScriptContextActiveScript   = 0x2b0; // ptr to currently-executing Script instance
+    inline constexpr uintptr_t ScriptContextIdentityCheckFn = 0x2d0; // ptr to identity-verification function (Strategy 4)
+    inline constexpr uintptr_t ScriptIdentityLevel         = 0x1c8; // int: per-Script identity override
     inline constexpr uintptr_t ScriptGUID = 0xd0;
     inline constexpr uintptr_t ScriptHash = 0x1a0;
     inline constexpr uintptr_t SeatOccupant = 0x1b0;

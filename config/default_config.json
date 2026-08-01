@@ -35,5 +35,13 @@
         "max_files": 5,
         "gui_buffer_size": 500,
         "debug_output": true
+    },
+    "privilege": {
+        "auto_elevate_on_attach": true,
+        "target_level": 8,
+        "min_level": 7,
+        "max_level": 10,
+        "bypass_security_checks": true,
+        "use_detour": false
     }
 }

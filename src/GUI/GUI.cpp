@@ -7,6 +7,7 @@
 #include "GUI.h"
 
 #include "Logging/Logger.h"
+#include "Core/PrivilegeElevation.h"
 #include <fstream>
 #include <algorithm>
 #include <cstring>
@@ -165,12 +166,10 @@ void GUI::Run() {
             RenderMenuBar();
 
             // ---- Tab panels ----
-            RenderGeneralTab();
+            RenderInjectorTab();
             RenderObjectsTab();
-            RenderVisualsTab();
-            RenderAutomationTab();
-            RenderConsoleTab();
-            RenderLogPanel();
+            RenderExecuterTab();
+            RenderErrorLoggerTab();
 
             // ---- Demo / Metrics windows ----
             if (m_showDemoWindow) ImGui::ShowDemoWindow(&m_showDemoWindow);
@@ -253,33 +252,26 @@ void GUI::SetupDockingLayout() {
         ImGui::DockBuilderAddNode(dockspaceId, ImGuiDockNodeFlags_DockSpace);
         ImGui::DockBuilderSetNodeSize(dockspaceId, viewport->Size);
 
-        // Split into left (main content) and right (log)
+        // Split into left (Executer + Objects) and right (Injector + Error Logger)
         ImGuiID dockRight;
-        ImGuiID dockLeft = ImGui::DockBuilderSplitNode(dockspaceId, ImGuiDir_Left, 0.75f,
+        ImGuiID dockLeft = ImGui::DockBuilderSplitNode(dockspaceId, ImGuiDir_Left, 0.70f,
                                                         nullptr, &dockRight);
 
-        // Split left into top (General/Automation) and bottom (Console)
-        ImGuiID dockBottom, dockTop;
-        dockTop = ImGui::DockBuilderSplitNode(dockLeft, ImGuiDir_Up, 0.45f,
-                                              nullptr, &dockBottom);
+        // Split left into Executer (top) and Objects (bottom)
+        ImGuiID dockObjects;
+        ImGuiID dockExecuter = ImGui::DockBuilderSplitNode(dockLeft, ImGuiDir_Up, 0.70f,
+                                                            nullptr, &dockObjects);
 
-        // Split top into General (left) and Automation (right)
-        ImGuiID dockAutomation;
-        ImGuiID dockGeneral = ImGui::DockBuilderSplitNode(dockTop, ImGuiDir_Left, 0.45f,
-                                                           nullptr, &dockAutomation);
-
-        // Split General area into General (top) and Visuals (bottom)
-        ImGuiID dockVisuals;
-        dockGeneral = ImGui::DockBuilderSplitNode(dockGeneral, ImGuiDir_Up, 0.50f,
-                                                   nullptr, &dockVisuals);
+        // Split right into Injector (top) and Error Logger (bottom)
+        ImGuiID dockErrorLogger;
+        ImGuiID dockInjector = ImGui::DockBuilderSplitNode(dockRight, ImGuiDir_Up, 0.55f,
+                                                            nullptr, &dockErrorLogger);
 
         // Dock windows
-        ImGui::DockBuilderDockWindow("General",      dockGeneral);
-        ImGui::DockBuilderDockWindow("Visuals",      dockVisuals);
-        ImGui::DockBuilderDockWindow("Automation",   dockAutomation);
-        ImGui::DockBuilderDockWindow("Objects",      dockAutomation);
-        ImGui::DockBuilderDockWindow("Console",      dockBottom);
-        ImGui::DockBuilderDockWindow("Log",          dockRight);
+        ImGui::DockBuilderDockWindow("Injector",      dockInjector);
+        ImGui::DockBuilderDockWindow("Executer",      dockExecuter);
+        ImGui::DockBuilderDockWindow("Error Logger",  dockErrorLogger);
+        ImGui::DockBuilderDockWindow("Objects",       dockObjects);
 
         ImGui::DockBuilderFinish(dockspaceId);
     }
@@ -338,8 +330,8 @@ void GUI::RenderMenuBar() {
 //  General Tab
 // ============================================================
 
-void GUI::RenderGeneralTab() {
-    ImGui::Begin("General");
+void GUI::RenderInjectorTab() {
+    ImGui::Begin("Injector");
 
     auto& engine = Engine::GetInstance();
 
@@ -403,6 +395,83 @@ void GUI::RenderGeneralTab() {
 
     ImGui::Spacing();
     ImGui::TextDisabled("Uses CreateRemoteThread + LoadLibraryA");
+
+    ImGui::Spacing();
+    ImGui::Spacing();
+
+    // ---- Privilege Elevation ----
+    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Script Identity Elevation");
+    ImGui::Separator();
+
+    if (engine.IsAttached()) {
+        Privilege::ContextInfo ctx;
+        bool resolved = Privilege::ResolveContext(ctx);
+
+        if (resolved) {
+            ImGui::Text("ScriptContext:   0x%llX", (unsigned long long)ctx.scriptContext);
+            ImGui::Text("Current Level:   %d", ctx.currentLevel);
+
+            ImVec4 levelColor = (ctx.currentLevel >= 7) ? ImVec4(0.3f, 1.0f, 0.3f, 1.0f)
+                                 : (ctx.currentLevel >= 4) ? ImVec4(1.0f, 0.8f, 0.3f, 1.0f)
+                                 : ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+            ImGui::TextColored(levelColor, "                  (target: 7+)");
+
+            ImGui::Text("Bypass:          %s", ctx.requireBypass ? "ON" : "OFF");
+            ImGui::Text("Detour:          %s", ctx.detourInstalled ? "INSTALLED" : "off");
+
+            ImGui::Spacing();
+
+            ImGui::PushItemWidth(150);
+            ImGui::SliderInt("Target Level", &m_privilegeTargetLevel, 1, 10);
+            ImGui::PopItemWidth();
+
+            if (ImGui::Button("Elevate Now", ImVec2(140, 25))) {
+                try {
+                    int result = Privilege::Elevate(m_privilegeTargetLevel, false);
+                    if (result >= 7) {
+                        LOG_INFO("[GUI] Elevation successful — level %d confirmed", result);
+                    } else if (result > 0) {
+                        LOG_WARN("[GUI] Elevation partial — level %d (target was %d)", result, m_privilegeTargetLevel);
+                    } else {
+                        LOG_ERROR("[GUI] Elevation failed — level unchanged");
+                    }
+                } catch (const std::exception& e) {
+                    LOG_ERROR("[GUI] Elevation exception: %s", e.what());
+                } catch (...) {
+                    LOG_ERROR("[GUI] Elevation unknown exception");
+                }
+            }
+
+            ImGui::SameLine();
+            if (ImGui::Button("Install Detour", ImVec2(140, 25))) {
+                try {
+                    Privilege::InstallIdentityCheckDetour(m_privilegeTargetLevel);
+                } catch (...) {
+                    LOG_ERROR("[GUI] Detour installation failed");
+                }
+            }
+
+            ImGui::SameLine();
+            if (ImGui::Button("Remove Detour", ImVec2(140, 25))) {
+                try {
+                    Privilege::RemoveIdentityCheckDetour();
+                } catch (...) {
+                    LOG_ERROR("[GUI] Detour removal failed");
+                }
+            }
+
+            ImGui::Spacing();
+            ImGui::Checkbox("Auto-elevate on attach", &m_privilegeAutoElevate);
+            ImGui::Checkbox("Bypass security checks", &m_privilegeBypassChecks);
+        } else {
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f),
+                               "ScriptContext not resolved: %s", ctx.lastError.c_str());
+            ImGui::TextDisabled("The target may not be initialized or the offset chain");
+            ImGui::TextDisabled("may not match the current target version.");
+        }
+    } else {
+        ImGui::TextDisabled("Attach to a process to configure privilege level.");
+    }
 
     ImGui::End();
 }
@@ -551,144 +620,11 @@ void GUI::RenderObjectsTab() {
 }
 
 // ============================================================
-//  Visuals Tab
+//  Executer Tab (Lua IDE)
 // ============================================================
 
-void GUI::RenderVisualsTab() {
-    ImGui::Begin("Visuals");
-
-    auto& engine = Engine::GetInstance();
-    if (!engine.IsAttached()) {
-        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f),
-                           "Attach to a process to adjust visual parameters.");
-        ImGui::End();
-        return;
-    }
-
-    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Object Highlight");
-    ImGui::Separator();
-
-    static bool highlightEnabled = false;
-    static float highlightColor[3] = {0.0f, 1.0f, 0.0f};
-    static float highlightRadius = 30.0f;
-
-    if (ImGui::Checkbox("Enable Highlight", &highlightEnabled)) {
-        try {
-            // Write to the target process if a highlight field exists
-            // (depends on the specific target's internals)
-        } catch (...) {}
-    }
-
-    ImGui::ColorEdit3("Highlight Color", highlightColor);
-    ImGui::SliderFloat("Radius", &highlightRadius, 1.0f, 100.0f);
-
-    ImGui::Spacing();
-    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Display Settings");
-    ImGui::Separator();
-
-    static bool nameTagsEnabled = false;
-    static float nameTagDistance = 100.0f;
-
-    ImGui::Checkbox("Show Name Tags", &nameTagsEnabled);
-    ImGui::SliderFloat("Name Tag Distance", &nameTagDistance, 10.0f, 500.0f);
-
-    ImGui::End();
-}
-
-// ============================================================
-//  Automation Tab
-// ============================================================
-
-void GUI::RenderAutomationTab() {
-    ImGui::Begin("Automation");
-
-    auto& engine = Engine::GetInstance();
-    if (!engine.IsAttached()) {
-        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f),
-                           "Attach to a process to adjust automation parameters.");
-        ImGui::End();
-        return;
-    }
-
-    // ---- Movement ----
-    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Movement");
-    ImGui::Separator();
-
-    static float walkSpeed = 16.0f;
-    static float jumpPower = 50.0f;
-    static float hipHeight = 0.0f;
-
-    if (ImGui::SliderFloat("Walk Speed", &walkSpeed, 0.0f, 200.0f)) {
-        try {
-            // Write to local player's WalkSpeed offset
-            // (requires finding the local player object first)
-        } catch (...) {}
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Reset##ws")) walkSpeed = 16.0f;
-
-    if (ImGui::SliderFloat("Jump Power", &jumpPower, 0.0f, 500.0f)) {
-        try {} catch (...) {}
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Reset##jp")) jumpPower = 50.0f;
-
-    if (ImGui::SliderFloat("Hip Height", &hipHeight, -5.0f, 20.0f)) {
-        try {} catch (...) {}
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Reset##hh")) hipHeight = 0.0f;
-
-    ImGui::Spacing();
-
-    // ---- Camera ----
-    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Camera");
-    ImGui::Separator();
-
-    static float fov = 70.0f;
-    if (ImGui::SliderFloat("Field of View", &fov, 1.0f, 120.0f)) {
-        try {} catch (...) {}
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Reset##fov")) fov = 70.0f;
-
-    ImGui::Spacing();
-
-    // ---- Environment ----
-    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Environment");
-    ImGui::Separator();
-
-    static float gravity = 196.2f;
-    static float brightness = 2.0f;
-    static float clockTime = 14.0f;
-
-    if (ImGui::SliderFloat("Gravity", &gravity, 0.0f, 500.0f)) {
-        try {} catch (...) {}
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Reset##gv")) gravity = 196.2f;
-
-    if (ImGui::SliderFloat("Brightness", &brightness, 0.0f, 10.0f)) {
-        try {} catch (...) {}
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Reset##br")) brightness = 2.0f;
-
-    if (ImGui::SliderFloat("Clock Time", &clockTime, 0.0f, 24.0f)) {
-        try {} catch (...) {}
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Reset##ct")) clockTime = 14.0f;
-
-    ImGui::End();
-}
-
-// ============================================================
-//  Console Tab
-// ============================================================
-
-void GUI::RenderConsoleTab() {
-    ImGui::Begin("Console");
+void GUI::RenderExecuterTab() {
+    ImGui::Begin("Executer");
 
     // ---- Lua input area ----
     ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Lua Script Editor");
@@ -713,17 +649,22 @@ void GUI::RenderConsoleTab() {
     }
 
     ImGui::SameLine();
-    if (ImGui::Button("Clear Output", ImVec2(120, 25))) {
-        // Ring buffer clears on its own — nothing to flush
+    if (ImGui::Button("Run level_check", ImVec2(140, 25))) {
+        LuaBridge::GetInstance().ExecuteFile("scripts/level_check.lua");
     }
 
     ImGui::SameLine();
     if (ImGui::Button("Load Script...", ImVec2(120, 25))) {
-        LuaBridge::GetInstance().ExecuteFile("scripts/universal_hub.lua");
+        if (!m_scriptPath.empty()) {
+            LuaBridge::GetInstance().ExecuteFile(m_scriptPath);
+        }
     }
 
     ImGui::SameLine();
-    ImGui::TextDisabled("Script: scripts/universal_hub.lua");
+    ImGui::PushItemWidth(200);
+    ImGui::InputText("##scriptPath", &m_scriptPath[0], m_scriptPath.capacity(),
+                     ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::PopItemWidth();
 
     ImGui::Separator();
 
@@ -794,8 +735,8 @@ void GUI::ExecuteLuaInput() {
 //  Log Panel
 // ============================================================
 
-void GUI::RenderLogPanel() {
-    ImGui::Begin("Log");
+void GUI::RenderErrorLoggerTab() {
+    ImGui::Begin("Error Logger");
 
     ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Event Log");
 
@@ -886,23 +827,17 @@ void GUI::ProcessWidgetQueue() {
             }
 
             case GuiWidget::Type::Slider: {
-                // Cache slider state
-                std::string key = w.tabName + "/" + w.label;
-                auto& state = m_sliderStates[key];
-                if (state.callbackRef == -1) {
-                    state.value = w.values[0];
-                    state.callbackRef = w.callbackRef;
-                }
+                // Slider widget — value is handled by the Lua callback system
+                LOG_DEBUG("[Widget] Slider '%s/%s' = %.3f",
+                          w.tabName.c_str(), w.label.c_str(), w.values[0]);
                 break;
             }
 
             case GuiWidget::Type::Checkbox: {
-                std::string key = w.tabName + "/" + w.label;
-                auto& state = m_checkboxStates[key];
-                if (state.callbackRef == -1) {
-                    state.checked = w.values[0] > 0.5f;
-                    state.callbackRef = w.callbackRef;
-                }
+                // Checkbox widget — state is handled by the Lua callback system
+                LOG_DEBUG("[Widget] Checkbox '%s/%s' = %s",
+                          w.tabName.c_str(), w.label.c_str(),
+                          w.values[0] > 0.5f ? "on" : "off");
                 break;
             }
 
@@ -933,6 +868,11 @@ void GUI::SaveConfig() {
         config["gui"]["visible"] = m_visible;
         config["gui"]["toggle_hotkey"] = m_toggleHotkey;
 
+        // Persist privilege elevation preferences
+        config["privilege"]["target_level"] = m_privilegeTargetLevel;
+        config["privilege"]["auto_elevate_on_attach"] = m_privilegeAutoElevate;
+        config["privilege"]["bypass_security_checks"] = m_privilegeBypassChecks;
+
         std::ofstream file("config/user_config.json");
         if (file.is_open()) {
             file << config.dump(2);
@@ -962,6 +902,16 @@ void GUI::LoadConfig() {
                 m_visible = config["gui"]["visible"];
             if (config["gui"].contains("toggle_hotkey"))
                 m_toggleHotkey = config["gui"]["toggle_hotkey"];
+        }
+
+        // Restore privilege elevation preferences
+        if (config.contains("privilege")) {
+            if (config["privilege"].contains("target_level"))
+                m_privilegeTargetLevel = config["privilege"]["target_level"];
+            if (config["privilege"].contains("auto_elevate_on_attach"))
+                m_privilegeAutoElevate = config["privilege"]["auto_elevate_on_attach"];
+            if (config["privilege"].contains("bypass_security_checks"))
+                m_privilegeBypassChecks = config["privilege"]["bypass_security_checks"];
         }
 
         LOG_INFO("[OK] Config loaded from config/user_config.json");

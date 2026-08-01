@@ -17,7 +17,6 @@
 #include <fstream>
 #include <sstream>
 #include <cstring>
-#include <unordered_set>
 #include <nlohmann/json.hpp>
 
 // LuaU / Luau headers
@@ -28,6 +27,7 @@
 #include "../Core/Engine.h"
 #include "../Core/Memory.h"
 #include "../Core/offsets.h"
+#include "../Core/PrivilegeElevation.h"
 
 // ---- Forward Declarations of Bridge C Functions ----
 
@@ -68,6 +68,11 @@ static int l_get_module_base(lua_State* L);
 // Logging
 static int l_log(lua_State* L);
 static int l_print_bridge(lua_State* L);
+
+// Privilege elevation
+static int l_get_privilege_level(lua_State* L);
+static int l_set_privilege_level(lua_State* L);
+static int l_bypass_security_checks(lua_State* L);
 
 // ---- Table of Bridge Functions to Register ----
 
@@ -110,39 +115,16 @@ static const luaL_Reg kBridgeFunctions[] = {
     {"log",                 l_log},
     {"print",               l_print_bridge},  // Override Lua print()
 
+    // Privilege elevation
+    {"get_privilege_level",    l_get_privilege_level},
+    {"set_privilege_level",    l_set_privilege_level},
+    {"bypass_security_checks", l_bypass_security_checks},
+
     {nullptr, nullptr}
 };
 
-// ---- Safe Standard Library Subset ----
-
-// Functions we allow from the standard Lua libraries
-static const char* kSafeGlobals[] = {
-    // Basic
-    "assert", "error", "ipairs", "next", "pairs", "pcall",
-    "select", "tonumber", "tostring", "type", "unpack",
-    "xpcall", "rawequal", "rawget", "rawset", "setmetatable",
-    "getmetatable",
-
-    // Math (subset)
-    "math_abs", "math_ceil", "math_floor", "math_max", "math_min",
-    "math_sqrt", "math_pi", "math_huge",
-
-    // String (subset)
-    "string_byte", "string_char", "string_find", "string_format",
-    "string_gmatch", "string_gsub", "string_len", "string_lower",
-    "string_match", "string_rep", "string_reverse", "string_sub",
-    "string_upper", "string_split",
-
-    // Table
-    "table_insert", "table_remove", "table_sort", "table_concat",
-    "table_find", "table_create", "table_freeze", "table_isfrozen",
-
-    // Coroutine-aware
-    "coroutine_create", "coroutine_resume", "coroutine_status",
-    "coroutine_wrap", "coroutine_yield",
-
-    nullptr
-};
+// Sandbox instruction budget (per-thread, 1M instructions)
+static constexpr int kSandboxInstructionLimit = 1000000;
 
 // ---- Singleton Access ----
 
@@ -199,77 +181,13 @@ void LuaBridge::Shutdown() {
 // ============================================================
 
 void LuaBridge::ApplySandbox() {
-    // Strategy: Create a new global table that contains only the safe
-    // standard library subset, then set it as the global environment.
-
-    // 1. Create a new table to serve as the sandboxed global environment
-    lua_newtable(L);  // [new_globals]
-
-    // 2. Copy safe standard library functions from the original globals
-    lua_pushglobaltable(L);  // [new_globals, old_globals]
-
-    for (int i = 0; kSafeGlobals[i] != nullptr; ++i) {
-        const char* name = kSafeGlobals[i];
-
-        // Names like "math_abs" map to math.abs in the original table
-        // We need to traverse the path and copy the value
-        // For simplicity, handle the underscore notation:
-        // "math_abs" → old_globals["math"]["abs"]
-        std::string fullName(name);
-        size_t underscore = fullName.find('_');
-
-        if (underscore != std::string::npos) {
-            // Dotted path: e.g. math.abs
-            std::string lib = fullName.substr(0, underscore);     // "math"
-            std::string func = fullName.substr(underscore + 1);   // "abs"
-
-            // Push the library table
-            lua_pushstring(L, lib.c_str());  // [ng, og, "math"]
-            if (lua_rawget(L, -2) == LUA_TTABLE) {
-                // [ng, og, math_table]
-                lua_pushstring(L, func.c_str());  // [ng, og, math_table, "abs"]
-                if (lua_rawget(L, -2) == LUA_TFUNCTION) {
-                    // [ng, og, math_table, func]
-                    // Store in new globals as math_abs (or we could rebuild
-                    // the nested table structure)
-                    lua_pushstring(L, name);        // [ng, og, mt, func, "math_abs"]
-                    lua_pushvalue(L, -2);           // [ng, og, mt, func, "math_abs", func]
-                    lua_rawset(L, -6);              // [ng, og, mt, func]
-                }
-                lua_pop(L, 2);  // pop func (or nil) + math_table
-            } else {
-                lua_pop(L, 1);  // pop non-table
-            }
-        } else {
-            // Simple global: e.g. "assert", "ipairs"
-            lua_pushstring(L, name);           // [ng, og, "assert"]
-            if (lua_rawget(L, -2) == LUA_TFUNCTION) {
-                // [ng, og, func]
-                lua_pushstring(L, name);        // [ng, og, func, "assert"]
-                lua_pushvalue(L, -2);           // [ng, og, func, "assert", func]
-                lua_rawset(L, -5);              // [ng, og, func]
-            }
-            lua_pop(L, 1);  // pop func (or nil)
-        }
-    }
-
-    lua_pop(L, 1);  // pop old globals — [new_globals]
-
-    // 3. Copy safe essential fields
-    lua_pushstring(L, "_VERSION");
-    lua_pushstring(L, "Luau 0.663 (sandboxed)");
-    lua_rawset(L, -3);
-
-    // 4. Set the sandboxed table as the global environment
-    // In Luau, we use lua_setglobal for the __env mechanism via luaL_sandbox
-    // For simplicity, we replace the global table reference
-    lua_pushvalue(L, -1);          // [new_globals, new_globals]
-    lua_setglobal(L, "_G");        // _G = new_globals; [new_globals]
-
-    // Use Luau sandbox API if available (provides time/memory limits)
-    // luaL_sandbox(L, 1000000); // 1M instructions limit
-
-    lua_pop(L, 1);  // clean stack
+    // Use Luau's built-in sandbox API which replaces the global environment
+    // with a whitelisted subset of standard-library functions and enforces
+    // per-thread instruction limits. Bridge functions registered afterward
+    // (in RegisterBridgeFunctions) land in the sandboxed globals table.
+    luaL_sandbox(L, kSandboxInstructionLimit);
+    luaL_sandboxthread(L, kSandboxInstructionLimit);
+    LOG_DEBUG("[LuaBridge] Sandbox applied (instruction limit: %d)", kSandboxInstructionLimit);
 }
 
 // ============================================================
@@ -1304,4 +1222,80 @@ static int l_get_module_base(lua_State* L) {
     }
 
     return 1;
+}
+
+// ---------------------------- Privilege Elevation ----------------------------
+
+/**
+ * get_privilege_level() → level | nil, error
+ *
+ * Read the current script execution identity tier from the target process.
+ * Returns 0 if the target is not attached or the ScriptContext chain is
+ * not yet resolved.
+ */
+static int l_get_privilege_level(lua_State* L) {
+    try {
+        int level = Privilege::GetPrivilegeLevel();
+        lua_pushinteger(L, level);
+        return 1;
+    } catch (const std::exception& e) {
+        lua_pushnil(L);
+        lua_pushstring(L, e.what());
+        return 2;
+    }
+}
+
+/**
+ * set_privilege_level(level) → ok, confirmedLevel | false, error
+ *
+ * Write a new identity tier (1–10) into the target's ScriptContext and
+ * active Script object. Returns the readback-confirmed level on success.
+ */
+static int l_set_privilege_level(lua_State* L) {
+    int level = (int)luaL_checkinteger(L, 1);
+
+    try {
+        bool ok = Privilege::SetPrivilegeLevel(level);
+        if (!ok) {
+            lua_pushboolean(L, false);
+            lua_pushstring(L, "Failed to set privilege level — readback mismatch or chain unresolved");
+            return 2;
+        }
+        lua_pushboolean(L, true);
+        lua_pushinteger(L, Privilege::GetPrivilegeLevel());
+        return 2;
+    } catch (const std::exception& e) {
+        lua_pushboolean(L, false);
+        lua_pushstring(L, e.what());
+        return 2;
+    }
+}
+
+/**
+ * bypass_security_checks([enable=true]) → ok | false, error
+ *
+ * Toggle the ScriptContextRequireBypass flag in the target process.
+ * When enabled, all identity verification checks are skipped.
+ */
+static int l_bypass_security_checks(lua_State* L) {
+    bool enable = true;
+    if (lua_gettop(L) >= 1 && !lua_isnil(L, 1)) {
+        luaL_checktype(L, 1, LUA_TBOOLEAN);
+        enable = (lua_toboolean(L, 1) != 0);
+    }
+
+    try {
+        bool ok = Privilege::BypassSecurityChecks(enable);
+        if (!ok) {
+            lua_pushboolean(L, false);
+            lua_pushstring(L, "Failed to toggle security bypass — readback mismatch");
+            return 2;
+        }
+        lua_pushboolean(L, true);
+        return 1;
+    } catch (const std::exception& e) {
+        lua_pushboolean(L, false);
+        lua_pushstring(L, e.what());
+        return 2;
+    }
 }
