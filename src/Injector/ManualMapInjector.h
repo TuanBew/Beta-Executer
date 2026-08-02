@@ -55,9 +55,6 @@ private:
     ManualMapInjector(const ManualMapInjector&) = delete;
     ManualMapInjector& operator=(const ManualMapInjector&) = delete;
 
-    // ---- File I/O ----
-    bool ReadFromFile(const std::string& dllPath, std::vector<uint8_t>& out);
-
     // ---- PE Parsing ----
     bool ParsePE(const std::vector<uint8_t>& dllBytes);
 
@@ -90,9 +87,6 @@ private:
     uintptr_t m_mappedBase       = 0;
     size_t    m_imageSize        = 0;
     uintptr_t m_entryPointRva    = 0;
-
-    // Raw .reloc section data for ApplyRelocations to iterate over
-    std::vector<uint8_t> m_relocData;
 
     // Parsed imports: dllName → [ImportEntry]
     std::map<std::string, std::vector<ImportEntry>> m_imports;

