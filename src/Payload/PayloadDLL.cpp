@@ -7,6 +7,11 @@
 #include <TlHelp32.h>
 #include <cstring>
 
+// Luau / LuaU VM and Compiler headers
+#include <lua.h>
+#include <lualib.h>
+#include <luacode.h>
+
 // ---- Global State ----
 static HMODULE      g_hModule       = nullptr;
 static HANDLE       g_hPipe         = INVALID_HANDLE_VALUE;
@@ -424,12 +429,316 @@ static bool CaptureLuaStateViaTrampoline() {
     return g_luaState != 0;
 }
 
-// ---- Task 5 stub: Script Manager source (populated by Task 5) ----
-// These are temporary empty placeholders. Task 5 will replace them with
-// the embedded Lua bytecode for the Script Manager. The Heartbeat trampoline
-// callback references these symbols so the injection site is pre-wired.
-static const char  g_ScriptManagerSource[]   = "-- Task 5 placeholder\n";
-static const size_t g_ScriptManagerSourceLen  = 0;
+// ---- Script Manager Lua Source (Task 5/6) ----
+// Embedded as a raw string literal for development.
+// Task 8 will replace this with a CMake-generated include (xxd or equivalent).
+static const char g_ScriptManagerSource[] = R"lua(
+-- ScriptManager.lua — Embedded persistent execution layer
+-- Injected into the target's Lua VM via one-shot Heartbeat trampoline.
+-- Runs as legitimate Lua code within the target's scheduler.
+--
+-- FOR EDUCATIONAL DEMONSTRATION ONLY — controlled offline environment.
+
+-- Pipe handle and protocol constants are set as globals by the C++
+-- Heartbeat trampoline BEFORE this script is loaded.
+local PIPE_READ_MODE = 0x02  -- PIPE_READMODE_MESSAGE
+local FRAME_HEADER_SIZE = 11
+
+-- Command constants (must match PipeProtocol.h)
+local CMD_EXECUTE_SCRIPT = 0x01
+local CMD_EXECUTE_RESULT = 0x02
+local CMD_PING           = 0x03
+local CMD_PONG           = 0x04
+local CMD_SHUTDOWN       = 0x05
+
+-- Result codes
+local RESULT_OK    = 0
+local RESULT_ERROR = 1
+local RESULT_FATAL = 2
+
+-- ---- Utility: read exactly N bytes from pipe ----
+local function readBytes(pipeHandle, count)
+    -- We use a Lua-exposed read function set by the C++ side.
+    -- For Phase 1 testing, the C++ trampoline registers:
+    --   pipe_read(hPipe, buffer, size) -> bytesRead
+    -- into the global environment before loadstring(this script).
+    local buf = ""
+    local remaining = count
+    while remaining > 0 do
+        local chunk = pipe_read(pipeHandle, remaining)
+        if not chunk or #chunk == 0 then
+            return nil  -- pipe closed or error
+        end
+        buf = buf .. chunk
+        remaining = remaining - #chunk
+    end
+    return buf
+end
+
+-- ---- Utility: write bytes to pipe ----
+local function writeBytes(pipeHandle, data)
+    return pipe_write(pipeHandle, data)
+end
+
+-- ---- Read a frame header ----
+local function readFrameHeader(pipeHandle)
+    local header = readBytes(pipeHandle, FRAME_HEADER_SIZE)
+    if not header then return nil end
+
+    -- Parse little-endian fields
+    local magic = string.byte(header, 1)
+        + string.byte(header, 2) * 256
+        + string.byte(header, 3) * 65536
+        + string.byte(header, 4) * 16777216
+    if magic ~= 0x48554221 then  -- "HUB!"
+        return nil  -- bad magic
+    end
+
+    local version = string.byte(header, 5)
+    local cmd = string.byte(header, 6) + string.byte(header, 7) * 256
+    local payloadLen = string.byte(header, 8)
+        + string.byte(header, 9) * 256
+        + string.byte(header, 10) * 65536
+        + string.byte(header, 11) * 16777216
+
+    return cmd, payloadLen
+end
+
+-- ---- Build and send a RESULT frame ----
+local function sendResult(pipeHandle, status, errorMsg)
+    local payload = string.char(status)
+    if errorMsg then
+        payload = payload .. errorMsg .. "\0"
+    end
+    local len = #payload
+
+    -- Build frame header (11 bytes)
+    local frame = string.char(0x21, 0x42, 0x55, 0x48)  -- "HUB!" LE
+        .. string.char(0x01)       -- version
+        .. string.char(CMD_EXECUTE_RESULT % 256)
+        .. string.char(math.floor(CMD_EXECUTE_RESULT / 256))
+        .. string.char(len % 256)
+        .. string.char(math.floor(len / 256) % 256)
+        .. string.char(math.floor(len / 65536) % 256)
+        .. string.char(math.floor(len / 16777216))
+        .. payload
+
+    writeBytes(pipeHandle, frame)
+end
+
+-- ---- Build and send PONG frame with state flags ----
+local function sendPong(pipeHandle, stateFlags)
+    -- State flags packed as uint32 LE (4 bytes)
+    local payload = string.char(stateFlags % 256)
+        .. string.char(math.floor(stateFlags / 256) % 256)
+        .. string.char(math.floor(stateFlags / 65536) % 256)
+        .. string.char(math.floor(stateFlags / 16777216))
+    local len = #payload
+
+    local frame = string.char(0x21, 0x42, 0x55, 0x48)
+        .. string.char(0x01)
+        .. string.char(CMD_PONG % 256)
+        .. string.char(math.floor(CMD_PONG / 256))
+        .. string.char(len % 256)
+        .. string.char(math.floor(len / 256) % 256)
+        .. string.char(math.floor(len / 65536) % 256)
+        .. string.char(math.floor(len / 16777216))
+        .. payload
+
+    writeBytes(pipeHandle, frame)
+end
+
+-- ---- Main Script Manager ----
+-- Returns a function that takes a pipe handle argument.
+-- The C++ side calls this returned function to start the manager.
+return function(pipeHandle)
+    local running = true
+    local currentScript = nil
+    local activeCoroutine = nil
+
+    -- State flags for PONG responses
+    local STATE_READY     = 1   -- bit 0
+    local STATE_EXECUTING = 2   -- bit 1
+    local STATE_ERROR     = 4   -- bit 2
+    local stateFlags = STATE_READY
+
+    -- Connect to the target's heartbeat scheduler.
+    -- Uses the target's native task scheduler API.
+    local success, scheduler = pcall(function()
+        return get_scheduler and get_scheduler()
+    end)
+    if not success or not scheduler then
+        -- Fallback: try alternative API surface
+        sendResult(pipeHandle, RESULT_FATAL,
+            "Script Manager: cannot access scheduler API")
+        return
+    end
+
+    -- Register heartbeat callback.
+    -- On each scheduler tick, poll the pipe and dispatch any pending commands.
+    scheduler.Heartbeat:Connect(function()
+        -- Non-blocking poll: check if there's data on the pipe
+        local available = pipe_available(pipeHandle)
+        if not available or available == 0 then
+            return  -- nothing to read, skip this tick
+        end
+
+        -- Read the frame header
+        local cmd, payloadLen = readFrameHeader(pipeHandle)
+        if not cmd then
+            return  -- incomplete frame or pipe error
+        end
+
+        -- Read payload
+        local payload = nil
+        if payloadLen > 0 then
+            payload = readBytes(pipeHandle, payloadLen)
+            if not payload then return end
+        end
+
+        -- Dispatch by command type
+        if cmd == CMD_EXECUTE_SCRIPT then
+            if not payload then return end
+
+            stateFlags = STATE_EXECUTING
+
+            -- Kill any previously running script (hot-swap)
+            if activeCoroutine then
+                pcall(coroutine.close, activeCoroutine)
+                activeCoroutine = nil
+            end
+
+            -- Execute in a coroutine so we can hot-swap on next command
+            activeCoroutine = coroutine.create(function()
+                local ok, err = pcall(function()
+                    local fn, compileErr = loadstring(payload)
+                    if not fn then
+                        sendResult(pipeHandle, RESULT_ERROR,
+                            "Compile error: " .. tostring(compileErr))
+                        return
+                    end
+                    fn()
+                end)
+
+                if not ok then
+                    sendResult(pipeHandle, RESULT_ERROR,
+                        "Runtime error: " .. tostring(err))
+                    stateFlags = STATE_ERROR
+                else
+                    sendResult(pipeHandle, RESULT_OK, nil)
+                    stateFlags = STATE_READY
+                end
+            end)
+
+            -- Resume the coroutine (runs synchronously within this
+            -- heartbeat tick; if it yields, it'll be resumed next tick)
+            local coStatus, coErr = coroutine.resume(activeCoroutine)
+            if not coStatus then
+                sendResult(pipeHandle, RESULT_ERROR,
+                    "Coroutine error: " .. tostring(coErr))
+                stateFlags = STATE_ERROR
+                activeCoroutine = nil
+            end
+
+            if coroutine.status(activeCoroutine) == "dead" then
+                activeCoroutine = nil
+                stateFlags = STATE_READY
+            end
+
+        elseif cmd == CMD_PING then
+            sendPong(pipeHandle, stateFlags)
+
+        elseif cmd == CMD_SHUTDOWN then
+            if activeCoroutine then
+                pcall(coroutine.close, activeCoroutine)
+                activeCoroutine = nil
+            end
+            running = false
+            scheduler.Heartbeat:Disconnect()
+        end
+    end)
+
+    -- Initial ready signal — tell the controller we're alive
+    sendPong(pipeHandle, STATE_READY)
+
+    -- Keep the script alive (the heartbeat callback holds the reference).
+    -- The target's scheduler drives this loop; we just need to prevent
+    -- the function from returning while the Heartbeat connection is active.
+    while running do
+        -- If the target has a wait() or task.wait(), use it.
+        -- Otherwise the heartbeat scheduler keeps this alive.
+        pcall(function()
+            task and task.wait(1)
+        end)
+    end
+end
+)lua";
+static const size_t g_ScriptManagerSourceLen =
+    sizeof(g_ScriptManagerSource) - 1;  // exclude null terminator from R-string
+
+// ================================================================
+//  Task 6: Lua Pipe I/O Bridge Functions
+// ================================================================
+//
+// These C functions are registered as globals (pipe_read, pipe_write,
+// pipe_available) in the target Lua VM before the Script Manager is
+// loaded. The Script Manager calls them to communicate with the
+// UniversalHub controller through the named pipe.
+//
+// Each function receives the pipe handle as its first argument
+// (lightuserdata), but internally operates on the global g_hPipe
+// since there is only one pipe connection.
+
+// pipe_read(hPipe, count) -> string or nil
+// Reads up to `count` bytes from the named pipe. Returns nil on error
+// or if no data is available. Max 1 MB per read to prevent memory
+// exhaustion from malicious or buggy scripts.
+static int LuaPipeRead(lua_State* L) {
+    int count = static_cast<int>(luaL_checkinteger(L, 2));
+    if (count <= 0 || count > 1024 * 1024) {  // clamp: 1 byte to 1 MB
+        lua_pushnil(L);
+        return 1;
+    }
+
+    std::vector<uint8_t> buf(count);
+    DWORD bytesRead = 0;
+    BOOL ok = ReadFile(g_hPipe, buf.data(), static_cast<DWORD>(count),
+                       &bytesRead, nullptr);
+    if (!ok || bytesRead == 0) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    lua_pushlstring(L, reinterpret_cast<const char*>(buf.data()), bytesRead);
+    return 1;
+}
+
+// pipe_write(hPipe, data) -> bool
+// Writes `data` (a string) to the named pipe. Returns true if all bytes
+// were written successfully, false otherwise.
+static int LuaPipeWrite(lua_State* L) {
+    size_t len = 0;
+    const char* data = luaL_checklstring(L, 2, &len);
+    DWORD bytesWritten = 0;
+    BOOL ok = WriteFile(g_hPipe, data, static_cast<DWORD>(len),
+                        &bytesWritten, nullptr);
+    lua_pushboolean(L, ok && bytesWritten == len);
+    return 1;
+}
+
+// pipe_available(hPipe) -> int
+// Returns the number of bytes pending in the pipe (0 if none available
+// or if the pipe is invalid). The Script Manager calls this on each
+// Heartbeat tick to decide whether to perform a blocking read.
+static int LuaPipeAvailable(lua_State* L) {
+    DWORD available = 0;
+    if (!PeekNamedPipe(g_hPipe, nullptr, 0, nullptr, &available, nullptr)) {
+        lua_pushinteger(L, 0);
+        return 1;
+    }
+    lua_pushinteger(L, static_cast<lua_Integer>(available));
+    return 1;
+}
 
 // ================================================================
 //  Task 4: Privilege Elevation & Heartbeat Hijack
@@ -550,31 +859,81 @@ extern "C" void HeartbeatTrampolineCallback() {
     // restored — the target continues normally on the next tick.
     RestoreHeartbeat();
 
-    // ---- Script Manager Injection (stub — filled by Task 5/6) ----
-    //
-    // The Script Manager source (g_ScriptManagerSource) will be embedded as
-    // a static const char array in Task 5. Task 6 will wire the actual
-    // luau_compile + luau_load + lua_pcall sequence.
-    //
-    // For now, this is a call site that references the Task 5 symbols:
-    //   size_t bytecodeSize = 0;
-    //   char* bytecode = luau_compile(g_ScriptManagerSource,
-    //                                  g_ScriptManagerSourceLen,
-    //                                  nullptr, &bytecodeSize);
-    //   if (bytecode) {
-    //       int status = luau_load(g_luaState, "=ScriptManager",
-    //                              bytecode, bytecodeSize, 0);
-    //       free(bytecode);
-    //       if (status == 0) {
-    //           lua_pcall(g_luaState, 0, 0, 0);
-    //       }
-    //   }
+    auto* L = reinterpret_cast<lua_State*>(g_luaState);
 
-    // After the Script Manager is loaded, it takes over —
-    // it registers with the target's Heartbeat scheduler and
-    // polls the pipe on each tick. No further C++ involvement.
-    (void)g_ScriptManagerSource;    // suppress unused-variable warning
-    (void)g_ScriptManagerSourceLen;
+    // ---- Step 1: Register pipe I/O bridge functions in the global table ----
+    //
+    // ScriptManager.lua calls pipe_read(pipeHandle, count),
+    // pipe_write(pipeHandle, data), and pipe_available(pipeHandle).
+    // These C functions are exposed as Lua globals so the Script Manager
+    // can communicate with the UniversalHub controller through g_hPipe.
+
+    lua_pushcfunction(L, LuaPipeRead, "pipe_read");
+    lua_setglobal(L, "pipe_read");
+
+    lua_pushcfunction(L, LuaPipeWrite, "pipe_write");
+    lua_setglobal(L, "pipe_write");
+
+    lua_pushcfunction(L, LuaPipeAvailable, "pipe_available");
+    lua_setglobal(L, "pipe_available");
+
+    // ---- Step 2: Compile ScriptManager.lua to Luau bytecode ----
+
+    size_t bytecodeSize = 0;
+    char* bytecode = luau_compile(g_ScriptManagerSource,
+                                   g_ScriptManagerSourceLen,
+                                   nullptr, &bytecodeSize);
+    if (!bytecode) {
+        // Compilation failed — ScriptManager.lua has a syntax error.
+        // The Heartbeat is already restored; target continues normally.
+        return;
+    }
+
+    // ---- Step 3: Load the compiled bytecode into the Lua VM ----
+
+    int loadStatus = luau_load(L, "=ScriptManager", bytecode,
+                                bytecodeSize, 0);
+    std::free(bytecode);  // luau_compile allocates with malloc
+
+    if (loadStatus != 0) {
+        // Load error — error string is on the stack.
+        // Pop it and bail; heartbeat already restored.
+        lua_pop(L, 1);
+        return;
+    }
+
+    // ---- Step 4: Execute the loaded chunk to get the returned function ----
+    //
+    // ScriptManager.lua ends with: return function(pipeHandle) ... end
+    // The loaded chunk, when called, returns this inner function.
+    // We call the chunk with 0 args, expecting 1 result on the stack.
+
+    if (lua_pcall(L, 0, 1, 0) != 0) {
+        // Runtime error executing the chunk.
+        lua_pop(L, 1);
+        return;
+    }
+
+    // Stack now has: [ scriptManagerFn ]
+    // Push the pipe handle as its argument.
+
+    lua_pushlightuserdata(L, g_hPipe);
+
+    // Call scriptManagerFn(pipeHandle) — this starts the Script Manager.
+    // It registers with the target's Heartbeat scheduler and enters its
+    // event loop. This call blocks until the Script Manager returns
+    // (which only happens on SHUTDOWN command or fatal error).
+
+    if (lua_pcall(L, 1, 0, 0) != 0) {
+        // Script Manager crashed — error string is on the stack.
+        // Pop it; no further C++ involvement.
+        lua_pop(L, 1);
+    }
+
+    // Script Manager has returned (pipe closed, shutdown, or fatal error).
+    // The Heartbeat trampoline is already restored, so the target's
+    // original Heartbeat job resumes on the next scheduler tick.
+    // No further C++ code runs.
 }
 
 // ---- HijackHeartbeat: locate Heartbeat job and install one-shot trampoline ----
