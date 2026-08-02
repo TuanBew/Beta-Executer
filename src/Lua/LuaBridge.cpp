@@ -29,6 +29,7 @@
 #include "../Core/Memory.h"
 #include "../Core/offsets.h"
 #include "../Core/PrivilegeElevation.h"
+#include "../Protocol/PipeServer.h"
 
 // ---- Forward Declarations of Bridge C Functions ----
 
@@ -80,6 +81,10 @@ static int l_enumerate_jobs(lua_State* L);
 static int l_run_diagnostics(lua_State* L);
 static int l_scan_for_scriptcontext(lua_State* L);
 
+// Pipe protocol
+static int LuaPipeExecute(lua_State* L);
+static int LuaPipeConnected(lua_State* L);
+
 // ---- Table of Bridge Functions to Register ----
 
 static const luaL_Reg kBridgeFunctions[] = {
@@ -130,6 +135,10 @@ static const luaL_Reg kBridgeFunctions[] = {
     {"enumerate_jobs",         l_enumerate_jobs},
     {"run_diagnostics",        l_run_diagnostics},
     {"scan_for_scriptcontext", l_scan_for_scriptcontext},
+
+    // Pipe protocol
+    {"pipe_execute",      LuaPipeExecute},
+    {"pipe_connected",    LuaPipeConnected},
 
     {nullptr, nullptr}
 };
@@ -1529,4 +1538,44 @@ static int l_scan_for_scriptcontext(lua_State* L) {
     lua_pushnil(L);
     lua_pushstring(L, "not found within time budget");
     return 2;
+}
+
+// ---------------------------- Pipe Protocol ----------------------------
+
+/**
+ * pipe_execute(script_string) → success, error
+ *
+ * Dispatch a script string to the connected controller process via the
+ * named-pipe channel. Returns true on success; on failure returns false
+ * and an error message string.
+ */
+static int LuaPipeExecute(lua_State* L) {
+    size_t len = 0;
+    const char* script = luaL_checklstring(L, 1, &len);
+
+    std::string scriptStr(script, len);
+    std::string errorMsg;
+
+    bool ok = PipeServer::GetInstance().ExecuteScript(scriptStr, errorMsg);
+
+    lua_pushboolean(L, ok);
+    if (!ok && !errorMsg.empty()) {
+        lua_pushstring(L, errorMsg.c_str());
+    } else if (!ok) {
+        lua_pushstring(L, "Unknown error");
+    } else {
+        lua_pushnil(L);
+    }
+    return 2;  // success, error
+}
+
+/**
+ * pipe_connected() → bool
+ *
+ * Returns true when the named-pipe channel to the controller process is
+ * actively connected.
+ */
+static int LuaPipeConnected(lua_State* L) {
+    lua_pushboolean(L, PipeServer::GetInstance().IsConnected());
+    return 1;
 }
