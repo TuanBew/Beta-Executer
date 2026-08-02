@@ -33,8 +33,12 @@ struct ContextInfo {
     int       currentLevel     = 0;
     bool      requireBypass    = false;
     bool      detourInstalled  = false;
-    std::string resolutionPath;   // which path resolved DataModel ("PathA", "PathB", "ChildrenWalk")
+    std::string resolutionPath;
     std::string lastError;
+    int         candidateCount   = 0;
+    bool        pathATried       = false;
+    bool        pathBTried       = false;
+    bool        pathCTried       = false;
 };
 
 // ---- Pointer Chain Resolution (v2: multi-path + validation) ----
@@ -62,6 +66,14 @@ bool BypassSecurityChecks(bool enable = true);
 
 bool InstallIdentityCheckDetour(int level);
 bool RemoveIdentityCheckDetour();
+
+// ---- Path C: VisualEngine Resolution ----
+
+uintptr_t ResolveDataModelPathC(uintptr_t moduleBase);
+
+// ---- Diagnostics ----
+
+void RunDiagnostics();
 
 // ---- Orchestrator ----
 

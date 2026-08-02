@@ -74,6 +74,9 @@ static int l_get_privilege_level(lua_State* L);
 static int l_set_privilege_level(lua_State* L);
 static int l_bypass_security_checks(lua_State* L);
 static int l_resolve_context(lua_State* L);
+static int l_dump_memory(lua_State* L);
+static int l_enumerate_jobs(lua_State* L);
+static int l_run_diagnostics(lua_State* L);
 
 // ---- Table of Bridge Functions to Register ----
 
@@ -121,6 +124,9 @@ static const luaL_Reg kBridgeFunctions[] = {
     {"set_privilege_level",    l_set_privilege_level},
     {"bypass_security_checks", l_bypass_security_checks},
     {"resolve_context",        l_resolve_context},
+    {"dump_memory",            l_dump_memory},
+    {"enumerate_jobs",         l_enumerate_jobs},
+    {"run_diagnostics",        l_run_diagnostics},
 
     {nullptr, nullptr}
 };
@@ -1341,6 +1347,24 @@ static int l_resolve_context(lua_State* L) {
         lua_pushboolean(L, ok);
         lua_setfield(L, -2, "resolved");
 
+        lua_pushinteger(L, static_cast<lua_Integer>(ctx.fakeDataModel));
+        lua_setfield(L, -2, "fakeDataModel");
+
+        lua_pushboolean(L, ctx.detourInstalled);
+        lua_setfield(L, -2, "detourInstalled");
+
+        lua_pushinteger(L, ctx.candidateCount);
+        lua_setfield(L, -2, "candidateCount");
+
+        lua_pushboolean(L, ctx.pathATried);
+        lua_setfield(L, -2, "pathATried");
+
+        lua_pushboolean(L, ctx.pathBTried);
+        lua_setfield(L, -2, "pathBTried");
+
+        lua_pushboolean(L, ctx.pathCTried);
+        lua_setfield(L, -2, "pathCTried");
+
         if (!ok) {
             lua_pushstring(L, ctx.lastError.c_str());
             lua_setfield(L, -2, "error");
@@ -1352,4 +1376,111 @@ static int l_resolve_context(lua_State* L) {
         lua_pushstring(L, e.what());
         return 2;
     }
+}
+
+static int l_dump_memory(lua_State* L) {
+    uintptr_t addr = static_cast<uintptr_t>(luaL_checkinteger(L, 1));
+    int count = static_cast<int>(luaL_optinteger(L, 2, 64));
+    if (count < 1) count = 1;
+    if (count > 4096) count = 4096;
+
+    try {
+        auto bytes = Memory::ReadBytes(addr, static_cast<size_t>(count));
+        std::string hex;
+        hex.reserve(bytes.size() * 3);
+        char buf[4];
+        for (uint8_t b : bytes) {
+            sprintf(buf, "%02X ", b);
+            hex += buf;
+        }
+        if (!hex.empty()) hex.pop_back();
+        lua_pushstring(L, hex.c_str());
+        return 1;
+    } catch (const std::exception& e) {
+        lua_pushnil(L);
+        lua_pushstring(L, e.what());
+        return 2;
+    }
+}
+
+// SSO-aware MSVC string read (local copy for bridge use)
+static std::string BridgeReadMSVCString(uintptr_t stringAddr) {
+    try {
+        size_t capacity = Memory::Read<size_t>(stringAddr + 0x18);
+        size_t length   = Memory::Read<size_t>(stringAddr + 0x10);
+        if (length == 0 || length > 4096) return "";
+        if (capacity < 16) {
+            auto bytes = Memory::ReadBytes(stringAddr, (length < 15 ? length : 15) + 1);
+            if (bytes.empty()) return "";
+            bytes.push_back(0);
+            return std::string(reinterpret_cast<const char*>(bytes.data()),
+                               length < 15 ? length : 15);
+        }
+        uintptr_t ptr = Memory::Read<uintptr_t>(stringAddr);
+        if (ptr < 0x10000 || ptr >= 0x7FFFFFFFFFFF) return "";
+        return Memory::ReadString(ptr, length < 256 ? length : 256);
+    } catch (...) { return ""; }
+}
+
+static std::string BridgeReadClassName(uintptr_t objectAddr) {
+    try {
+        uintptr_t cd = Memory::Read<uintptr_t>(objectAddr + offsets::ClassDescriptor);
+        if (cd < 0x10000 || cd >= 0x7FFFFFFFFFFF) return "";
+        uintptr_t np = Memory::Read<uintptr_t>(cd + offsets::ClassDescriptorToClassName);
+        if (np < 0x10000 || np >= 0x7FFFFFFFFFFF) return "";
+        return Memory::ReadString(np, 64);
+    } catch (...) { return ""; }
+}
+
+static int l_enumerate_jobs(lua_State* L) {
+    try {
+        auto& engine = Engine::GetInstance();
+        if (!engine.IsAttached()) {
+            lua_newtable(L);
+            return 1;
+        }
+
+        uintptr_t base = engine.GetModuleBase();
+        uintptr_t tsPtr = Memory::Read<uintptr_t>(base + offsets::TaskSchedulerPointer);
+        if (tsPtr == 0) { lua_newtable(L); return 1; }
+
+        uintptr_t jobStart = Memory::Read<uintptr_t>(tsPtr + offsets::JobStart);
+        uintptr_t jobEnd   = Memory::Read<uintptr_t>(tsPtr + offsets::JobEnd);
+
+        lua_newtable(L);
+        int idx = 1;
+        size_t maxJobs = 256;
+        size_t count = 0;
+
+        for (uintptr_t cur = jobStart; cur < jobEnd && count < maxJobs;
+             cur += sizeof(uintptr_t), ++count) {
+            uintptr_t jobPtr = Memory::Read<uintptr_t>(cur);
+            if (jobPtr == 0) continue;
+
+            lua_newtable(L);
+
+            lua_pushinteger(L, static_cast<lua_Integer>(jobPtr));
+            lua_setfield(L, -2, "address");
+
+            lua_pushstring(L, BridgeReadMSVCString(jobPtr + offsets::Job_Name).c_str());
+            lua_setfield(L, -2, "name");
+
+            lua_pushstring(L, BridgeReadClassName(jobPtr).c_str());
+            lua_setfield(L, -2, "className");
+
+            lua_rawseti(L, -2, idx++);
+        }
+
+        return 1;
+    } catch (const std::exception& e) {
+        lua_pushnil(L);
+        lua_pushstring(L, e.what());
+        return 2;
+    }
+}
+
+static int l_run_diagnostics(lua_State* L) {
+    Privilege::RunDiagnostics();
+    lua_pushboolean(L, 1);
+    return 1;
 }

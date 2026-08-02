@@ -129,6 +129,26 @@ namespace Memory {
         return std::string(buffer.data(), len);
     }
 
+    // ---- Bulk Read ----
+
+    inline std::vector<uint8_t> ReadBytes(uintptr_t address, size_t count) {
+        auto& engine = Engine::GetInstance();
+        if (!engine.IsAttached()) {
+            throw std::runtime_error("Memory::ReadBytes: Not attached to a process");
+        }
+
+        std::vector<uint8_t> buffer(count, 0);
+        SIZE_T bytesRead = 0;
+        if (!ReadProcessMemory(engine.GetProcessHandle(),
+                               reinterpret_cast<LPCVOID>(address),
+                               buffer.data(), count, &bytesRead)) {
+            throw std::runtime_error("Memory::ReadBytes: ReadProcessMemory failed at 0x" +
+                                     std::to_string(address));
+        }
+        buffer.resize(bytesRead);
+        return buffer;
+    }
+
     /**
      * Get the base address of a loaded module in the target process.
      * Walks the module list of the target to find the named module.

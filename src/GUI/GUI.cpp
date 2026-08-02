@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <cstring>
 #include <ctime>
+#include <chrono>
 #include <filesystem>
 
 // ============================================================
@@ -799,9 +800,22 @@ void GUI::RenderExecuterTab() {
         ImGui::Dummy(ImVec2(0, 8));
         ImGui::SameLine();
         ImGui::TextColored(Theme::Success, "PID:%lu", engine.GetPid());
+
+        // Live privilege tier (cached 1s to avoid per-frame RPM)
+        ImGui::SameLine();
+        static int cachedLevel = 0;
+        static auto lastCheck = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastCheck).count() > 1000) {
+            cachedLevel = Privilege::GetPrivilegeLevel();
+            lastCheck = now;
+        }
+        ImVec4 lvColor = (cachedLevel >= 7) ? Theme::Success
+                       : (cachedLevel >= 4) ? Theme::Warning : Theme::Error;
+        ImGui::TextColored(lvColor, "Lv:%d", cachedLevel);
     } else {
         if (AccentButton("Attach", ImVec2(80, 32))) {
-            engine.AttachToProcess("RobloxPlayerBeta.exe");
+            engine.AttachToProcess("test.exe");
             if (engine.IsAttached()) m_objectsNeedRefresh = true;
         }
         ImGui::SameLine();
@@ -837,7 +851,7 @@ void GUI::RenderInjectorTab() {
 
         ImGui::Dummy(ImVec2(0, 6));
 
-        static char processInput[256] = "RobloxPlayerBeta.exe";
+        static char processInput[256] = "test.exe";
         ImGui::PushItemWidth(220);
         ImGui::InputText("##procName", processInput, sizeof(processInput));
         ImGui::PopItemWidth();
@@ -944,6 +958,13 @@ void GUI::RenderInjectorTab() {
             ImGui::Dummy(ImVec2(0, 6));
             ImGui::Checkbox("Auto-elevate on attach", &m_privilegeAutoElevate);
             ImGui::Checkbox("Bypass security checks", &m_privilegeBypassChecks);
+
+            ImGui::Dummy(ImVec2(0, 6));
+            if (ImGui::Button("Run Diagnostics", ImVec2(140, 30))) {
+                Privilege::RunDiagnostics();
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("Dumps chain data to Logger tab");
         } else {
             ImGui::TextColored(Theme::Warning,
                 "ScriptContext not resolved: %s", ctx.lastError.c_str());
@@ -962,6 +983,10 @@ void GUI::RenderInjectorTab() {
                 } catch (...) {
                     LOG_ERROR("[GUI] Elevation unknown exception");
                 }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Run Diagnostics", ImVec2(140, 30))) {
+                Privilege::RunDiagnostics();
             }
         }
     } else {
