@@ -8,14 +8,14 @@
 
 ## Overview
 
-Universal Hub currently executes Lua scripts in a host-side Luau VM with external memory I/O bridge functions (RPM/WPM). This architecture cannot run Roblox exploit scripts like Infinite Yield because they require access to Roblox's internal Lua environment (`game`, `Workspace`, `getgenv()`, etc.) which only exists inside the target process.
+Universal Hub currently executes Lua scripts in a host-side Luau VM with external memory I/O bridge functions (RPM/WPM). This architecture cannot run scripts that require access to the target process's internal Lua environment (global state, internal services, instance tree API, etc.) which only exists inside the target process.
 
 This specification defines a four-phase architecture that:
 
-1. Injects a DLL into Roblox via kernel-assisted manual mapping (bypassing user-mode AC hooks)
-2. Captures Roblox's `lua_State*` non-invasively (hardware breakpoint + VEH)
+1. Injects a DLL into the target via kernel-assisted manual mapping (bypassing user-mode AC hooks)
+2. Captures the target's `lua_State*` non-invasively (hardware breakpoint + VEH)
 3. Elevates script identity to level 10 (reusing existing Route H + privilege code)
-4. Executes arbitrary Lua payloads inside Roblox's Lua VM via a persistent Lua-level Script Manager
+4. Executes arbitrary Lua payloads inside the target's Lua VM via a persistent Lua-level Script Manager
 5. (Phase 4) Hides all modifications from Hyperion via EPT shadow page splitting
 
 ---
@@ -35,7 +35,7 @@ This specification defines a four-phase architecture that:
 │        │          └────────┬────────┘               │                │
 │        │                   │                        │                │
 ├────────┼───────────────────┼────────────────────────┼────────────────┤
-│        │                   │   RobloxPlayerBeta.exe │                │
+│        │                   │   test.exe                             │                │
 │        │                   │   ┌────────────────────┼─────────────┐  │
 │        │                   │   │  Injector DLL      │             │  │
 │        │                   │   │                    │             │  │
@@ -49,16 +49,16 @@ This specification defines a four-phase architecture that:
 │        │                   │   │  8. Restore original Heartbeat     │  │
 │        │                   │   │                    │               │  │
 │        │                   │   │  ┌─ Script Manager (Lua) ───────┐  │  │
-│        │                   │   │  │ • RunService.Heartbeat poll  │  │  │
+│        │                   │   │  │ • Heartbeat callback poll    │  │  │
 │        │                   │   │  │ • Named pipe command reader  │  │  │
 │        │                   │   │  │ • loadstring() executor      │  │  │
 │        │                   │   │  │ • Status reporter            │  │  │
 │        │                   │   │  │ • Coroutine wrapper (hot-swap)│  │  │
 │        │                   │   │  └──────────────────────────────┘  │  │
 │        │                   │   │                    │               │  │
-│        │                   │   │  ┌─ Roblox Lua VM ──────────────┐  │  │
-│        │                   │   │  │ game, Workspace, Players...  │  │  │
-│        │                   │   │  │ Infinite Yield executes!     │  │  │
+│        │                   │   │  ┌─ Target Lua VM ──────────────┐  │  │
+│        │                   │   │  │ global state, internal APIs, │  │  │
+│        │                   │   │  │ instance tree, core services │  │  │
 │        │                   │   │  └──────────────────────────────┘  │  │
 │        │                   │   └────────────────────────────────────┘  │
 └────────┴───────────────────┴──────────────────────────────────────────┘
@@ -95,7 +95,7 @@ Binary framed protocol over Windows named pipe (`\\.\pipe\UniversalHub`) in mess
 #### 1.2.2 lua_State* Capture (Hardware Breakpoint + VEH)
 
 1. DLL resolves `lua_pcall` address: `GetProcAddress(GetModuleHandleA("Luau"), "lua_pcall")`
-2. Sets hardware breakpoint on `lua_pcall` via `SetThreadContext` on the main Roblox thread:
+2. Sets hardware breakpoint on `lua_pcall` via `SetThreadContext` on the main target thread:
    - `DR0` = address of `lua_pcall`
    - `DR7` = enable local breakpoint on DR0
 3. Installs `AddVectoredExceptionHandler(1, handler)` — priority 1 VEH
@@ -114,7 +114,7 @@ Hardware breakpoints do not modify code bytes, making them invisible to CRC-base
 
 **CRITICAL:** Must execute BEFORE the Script Manager injection. The captured `lua_State*` may belong to a low-privilege script. We must elevate identity to level 10 first so the Script Manager (and all scripts it executes) run at maximum privilege.
 
-1. **Resolve ScriptContext** — reuse existing Route H heap scan (`PrivilegeElevation::ScanForScriptContext`). Already proven working: finds ScriptContext in ~270ms in live Roblox.
+1. **Resolve ScriptContext** — reuse existing Route H heap scan (`PrivilegeElevation::ScanForScriptContext`). Already proven working: finds ScriptContext in ~270ms in the live target.
 2. **Write identity level** — `Memory::Write<int>(scriptContext + 0x2C0, 10)` (via Capcom IOCTL in Phase 2, or direct WPM in Phase 1 dev)
 3. **Set active script pointer** — `Memory::Write<uintptr_t>(scriptContext + 0x2B0, ourScriptObject)` — points the ScriptContext to our script
 4. **Verify** — read back identity level, confirm it's 10
@@ -138,15 +138,15 @@ The Heartbeat trampoline fires **once** to inject the Lua Script Manager, then r
 
 #### 1.2.5 Lua Script Manager (Persistent, Lua-Level)
 
-The injected Script Manager runs as legitimate Lua code inside Roblox's scheduler. It uses Roblox's own `RunService.Heartbeat` event — indistinguishable from any game script.
+The injected Script Manager runs as legitimate Lua code inside the target's scheduler. It uses the target's own heartbeat scheduling API — indistinguishable from any normal script.
 
 ```lua
 -- Injected Script Manager (embedded in DLL's .rdata section)
 local PIPE_NAME = "\\\\.\\pipe\\UniversalHub"
 local pipe = ... -- opened from C++ side, passed via global
 
--- Register with Roblox's scheduler
-game:GetService("RunService").Heartbeat:Connect(function()
+-- Register with the target's heartbeat scheduler
+get_scheduler().Heartbeat:Connect(function()
     -- Poll pipe for new commands (non-blocking)
     local cmd, payload = readFrame(pipe)
     if cmd == 0x01 then  -- EXECUTE_SCRIPT
@@ -220,7 +220,7 @@ The Phase 1 DLL is the payload for the manual map injector. Once mapped:
 
 1. Validate manual mapping with a "Hello World" DLL (creates a file to confirm entry point execution)
 2. Replace test DLL with Phase 1 DLL, confirm pipe communication
-3. Verify Lua execution against RobloxPlayerBeta.exe
+3. Verify Lua execution against test.exe
 
 ---
 
@@ -233,7 +233,7 @@ UniversalHub.exe
     │
     ├─► CapcomHandle ──► DeviceIoControl(0xAA013044) ──► MmCopyVirtualMemory
     │
-    ├─► ManualMapInjector ──► CapcomHandle ──► DLL injected into Roblox
+    ├─► ManualMapInjector ──► CapcomHandle ──► DLL injected into target
     │
     ├─► NamedPipeServer ──► \\.\pipe\UniversalHub ──► DLL's pipe client
     │
@@ -243,7 +243,7 @@ UniversalHub.exe
 ### 3.2 Startup Sequence
 
 1. **Load Capcom.sys** — create/start service, obtain device handle
-2. **Manual-map DLL** — inject Phase 1 DLL into Roblox via `ManualMapInjector`
+2. **Manual-map DLL** — inject Phase 1 DLL into target via `ManualMapInjector`
 3. **Wait for pipe connection** — DLL connects back, sends initial PONG/STATUS with ready flag
 4. **Trigger lua_State capture** — DLL's VEH fires on next `lua_pcall`, captures `lua_State*`
 5. **Elevate privilege** — write level 10 to ScriptContext+0x2C0 (via Capcom)
@@ -257,7 +257,7 @@ UniversalHub.exe
 2. Script Manager kills any running user scripts (coroutine cleanup)
 3. Script Manager disconnects pipe
 4. UniversalHub closes pipe server
-5. No DLL cleanup needed (lives as long as Roblox process)
+5. No DLL cleanup needed (lives as long as target process)
 
 ---
 
