@@ -53,6 +53,19 @@ bool PipeServer::Initialize() {
 
     m_connected = true;
     LOG_INFO("[PipeServer] DLL connected on %s", PIPE_NAME);
+
+    // IMPORTANT 3 fix: ScriptManager.lua sends an initial PONG with
+    // STATE_READY on startup. Read and discard it so subsequent ReadFrame
+    // calls in ExecuteScript() / Ping() get the correct response frames,
+    // not the stale handshake PONG.
+    {
+        uint16_t dummyCmd = 0;
+        std::vector<uint8_t> dummyPayload;
+        ReadFrame(dummyCmd, dummyPayload);
+        LOG_INFO("[PipeServer] Initial handshake frame consumed (cmd=0x%X)",
+                 dummyCmd);
+    }
+
     return true;
 }
 

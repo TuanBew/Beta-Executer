@@ -30,6 +30,12 @@ local function readBytes(pipeHandle, count)
     local buf = ""
     local remaining = count
     while remaining > 0 do
+        -- IMPORTANT 5 fix: if the payload is split across multiple pipe
+        -- messages, a blocking pipe_read on an empty pipe would deadlock
+        -- the scheduler thread. Check availability before each read.
+        if pipe_available(pipeHandle) == 0 then
+            return nil  -- incomplete frame: rest hasn't arrived yet
+        end
         local chunk = pipe_read(pipeHandle, remaining)
         if not chunk or #chunk == 0 then
             return nil  -- pipe closed or error
@@ -223,17 +229,15 @@ return function(pipeHandle)
         end
     end)
 
-    -- Initial ready signal — tell the controller we're alive
+    -- Initial ready signal — tell the controller we're alive.
+    -- (Consumed by PipeServer::Initialize via the IMPORTANT 3 fix.)
     sendPong(pipeHandle, STATE_READY)
 
-    -- Keep the script alive (the heartbeat callback holds the reference).
-    -- The target's scheduler drives this loop; we just need to prevent
-    -- the function from returning while the Heartbeat connection is active.
-    while running do
-        -- If the target has a wait() or task.wait(), use it.
-        -- Otherwise the heartbeat scheduler keeps this alive.
-        pcall(function()
-            task and task.wait(1)
-        end)
-    end
+    -- IMPORTANT 4 fix: do NOT enter a blocking while/task.wait loop.
+    -- The Heartbeat connection (scheduler.Heartbeat:Connect above) keeps
+    -- this closure reference alive in the scheduler's callback table.
+    -- task.wait() calls lua_yield which crosses the C lua_pcall boundary
+    -- and throws LUA_ERRRUN, killing the Script Manager on its first tick.
+    -- Simply returning allows the trampoline's lua_pcall to complete
+    -- normally and return control to the scheduler.
 end

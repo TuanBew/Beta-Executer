@@ -84,9 +84,8 @@ set(SCRIPT_MANAGER_INC "${CMAKE_CURRENT_BINARY_DIR}/ScriptManager.lua.inc")
 add_custom_command(
     OUTPUT ${SCRIPT_MANAGER_INC}
     COMMAND powershell -NoProfile -Command
-        "[System.IO.File]::WriteAllBytes('${SCRIPT_MANAGER_INC}',
-         [System.Text.Encoding]::UTF8.GetBytes(
-         'R\"lua(' + [System.IO.File]::ReadAllText('${SCRIPT_MANAGER_SRC}') + ')lua\"'))"
+        "[System.IO.File]::WriteAllText('${SCRIPT_MANAGER_INC}',
+         'R"lua(' + [System.IO.File]::ReadAllText('${SCRIPT_MANAGER_SRC}') + ')lua"')"
     DEPENDS ${SCRIPT_MANAGER_SRC}
     COMMENT "Embedding ScriptManager.lua as C array"
 )
