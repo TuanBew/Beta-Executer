@@ -16,6 +16,18 @@ target_link_libraries(imgui_backend PUBLIC
     glfw
 )
 
+# ---- Injector — Kernel-assisted injection library (Phase 2) ----
+
+add_library(Injector STATIC
+    Injector/CapcomDriver.cpp
+    Injector/KernelExec.cpp
+    Injector/ManualMapInjector.cpp
+)
+
+target_include_directories(Injector PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
 # ---- Universal Hub Executable ----
 
 add_executable(UniversalHub
@@ -37,6 +49,7 @@ target_include_directories(UniversalHub PRIVATE
 
 target_link_libraries(UniversalHub PRIVATE
     imgui_backend
+    Injector
     glfw
     OpenGL::GL
     nlohmann_json::nlohmann_json
@@ -66,6 +79,13 @@ add_custom_command(TARGET UniversalHub POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
     $<TARGET_FILE:PayloadDLL>
     $<TARGET_FILE_DIR:UniversalHub>/PayloadDLL.dll
+)
+
+# Bundle Capcom.sys into build output
+add_custom_command(TARGET UniversalHub POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${CMAKE_SOURCE_DIR}/scripts/Capcom.sys
+    $<TARGET_FILE_DIR:UniversalHub>/Capcom.sys
 )
 
 # Windows-specific: require admin for process access

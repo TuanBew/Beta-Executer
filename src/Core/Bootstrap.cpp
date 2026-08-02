@@ -92,3 +92,16 @@ namespace Bootstrap {
     }
 
 } // namespace Bootstrap
+
+// ---- Phase 2: Manual-map injection through kernel R/W ----
+
+#include "../Injector/ManualMapInjector.h"
+#include "../Injector/CapcomDriver.h"
+
+namespace Bootstrap {
+
+bool ManualMapIntoProcess(DWORD pid, const std::string& dllPath) {
+    return ManualMapInjector::GetInstance().Inject(pid, dllPath);
+}
+
+} // namespace Bootstrap

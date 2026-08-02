@@ -35,6 +35,10 @@
 #include "Lua/LuaBridge.h"
 #include "GUI/GUI.h"
 #include "Protocol/PipeServer.h"
+#include "Injector/CapcomDriver.h"
+#include "Injector/KernelExec.h"
+
+static std::string g_injectMode;   // "legacy" (default) or "manual"
 
 static void PrintUsage() {
     printf("\n");
@@ -185,7 +189,11 @@ static void RunConsoleRepl() {
                 continue;
             }
             LOG_INFO("FOR EDUCATIONAL DEMONSTRATION ONLY");
-            Bootstrap::LoadIntoProcess(args);
+            if (g_injectMode == "manual") {
+                Bootstrap::ManualMapIntoProcess(Engine::GetInstance().GetPid(), args);
+            } else {
+                Bootstrap::LoadIntoProcess(args);
+            }
         }
         else if (cmd == "crash") {
             LOG_INFO("Triggering test crash in 1 second...");
@@ -212,6 +220,14 @@ int main(int argc, char* argv[]) {
     // ---- 3. LuaBridge (LuaU VM + sandbox + bridges) ----
     if (!LuaBridge::GetInstance().Initialize()) {
         LOG_WARN("[Main] LuaBridge failed to initialize — scripting will be unavailable");
+    }
+
+    // ---- Load Capcom driver (Phase 2 kernel R/W) ----
+    if (!CapcomDriver::GetInstance().LoadDriver()) {
+        LOG_WARN("[Main] Capcom driver not loaded — falling back to user-mode RPM/WPM");
+    } else {
+        LOG_INFO("[Main] Capcom.sys loaded — kernel R/W available");
+        KernelExec::GetInstance().Initialize();
     }
 
     // ---- 4. Auto-attach via --attach flag (accepts PID or process name) ----
@@ -250,6 +266,8 @@ int main(int argc, char* argv[]) {
             runScript = argv[++i];
         } else if (a == "--run-pipe" && i + 1 < argc) {
             runPipeScript = argv[++i];
+        } else if (a == "--inject" && i + 1 < argc) {
+            g_injectMode = argv[++i];  // "manual" or "legacy"
         }
     }
 
@@ -298,6 +316,8 @@ int main(int argc, char* argv[]) {
     LuaBridge::GetInstance().Shutdown();
     PipeServer::GetInstance().Shutdown();
     Engine::GetInstance().Detach();
+    KernelExec::GetInstance().Shutdown();   // restore HalDispatchTable before driver unload
+    CapcomDriver::GetInstance().UnloadDriver();
     Privilege::Cleanup();
     Logging::CrashHandler::GetInstance().Uninstall();
     Logging::Logger::GetInstance().Shutdown();

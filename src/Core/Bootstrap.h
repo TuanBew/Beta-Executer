@@ -27,4 +27,15 @@ namespace Bootstrap {
      */
     bool LoadIntoProcess(const std::string& dllPath);
 
+    /**
+     * Manual-map a DLL into the target process via kernel R/W (Capcom.sys).
+     * Does NOT call LoadLibraryA — the DLL is mapped manually with PE parsing,
+     * import resolution, and relocation fixup through kernel-mode IOCTLs.
+     *
+     * @param pid       Target process ID.
+     * @param dllPath   Absolute path to the DLL file.
+     * @return true if mapped and entry point executed successfully.
+     */
+    bool ManualMapIntoProcess(DWORD pid, const std::string& dllPath);
+
 } // namespace Bootstrap
