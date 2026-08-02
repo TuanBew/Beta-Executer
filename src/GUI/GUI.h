@@ -1,16 +1,16 @@
 /**
  * GUI.h — Dear ImGui / GLFW Control Panel
  *
- * Creates a standalone window with a Dear ImGui docking interface.
+ * Creates a standalone window with a Dear ImGui interface.
  * The GUI reads widget descriptions from LuaBridge's queue and renders
  * them as interactive ImGui controls (sliders, checkboxes, buttons,
  * color pickers, text, and log panels).
  *
- * Tabbed layout:
- *   - Injector     — Process attach/detach, bootstrap, privilege elevation
- *   - Executer     — Lua script editor and execution output (IDE)
- *   - Error Logger — Filtered event log with level checkboxes
- *   - Objects      — Object tree browser, communication object scanner
+ * Single-window layout with tab navigation:
+ *   - Executer  — Multi-tab code editor + script manager + output + toolbar
+ *   - Injector  — Process attach/detach, bootstrap, privilege elevation
+ *   - Logger    — Filtered event log
+ *   - Objects   — Object tree browser, communication object scanner
  *
  * FOR EDUCATIONAL DEMONSTRATION ONLY
  */
@@ -22,63 +22,18 @@
 #include <functional>
 #include <chrono>
 
-// Forward declarations
 struct GLFWwindow;
 struct GuiWidget;
 
-/**
- * GUI singleton — manages the GLFW window and ImGui rendering loop.
- *
- * On each frame:
- *  1. Poll GLFW events
- *  2. Start ImGui frame
- *  3. Consume widget queue from LuaBridge
- *  4. Render docked panels
- *  5. Call LuaBridge::OnFrame() for module lifecycle
- *  6. Render ImGui + swap buffers
- */
 class GUI {
 public:
     static GUI& GetInstance();
-
-    /**
-     * Initialize the GLFW window and ImGui context.
-     * @param title     Window title.
-     * @param width     Initial width in pixels.
-     * @param height    Initial height in pixels.
-     * @return true if initialization succeeded.
-     */
     bool Initialize(const std::string& title, int width = 1280, int height = 720);
-
-    /**
-     * Cleanup ImGui and GLFW.
-     */
     void Shutdown();
-
-    /**
-     * Run the main render loop. Blocks until the window is closed.
-     */
     void Run();
-
-    /**
-     * Request the main loop to stop (called when window close is requested).
-     */
     void RequestStop();
-
-    /**
-     * @return true if the GUI is currently running.
-     */
     bool IsRunning() const;
-
-    /**
-     * Set the hotkey for toggling GUI visibility (default: INSERT = 0x2D).
-     * Pass 0 to disable toggle hotkey.
-     */
     void SetToggleHotkey(int vkCode);
-
-    /**
-     * @return true if the GUI panel is currently visible.
-     */
     bool IsVisible() const;
 
 private:
@@ -87,26 +42,29 @@ private:
     GUI(const GUI&) = delete;
     GUI& operator=(const GUI&) = delete;
 
-    // ---- Frame callbacks ----
     static void GlfwErrorCallback(int error, const char* description);
 
-    // ---- Rendering helpers ----
     void RenderMenuBar();
     void RenderInjectorTab();
     void RenderObjectsTab();
     void RenderExecuterTab();
     void RenderErrorLoggerTab();
+    void RenderPopups();
 
-    // ---- Widget consumption ----
     void ProcessWidgetQueue();
-
-    // ---- Lua console ----
     void ExecuteLuaInput();
 
-    // ---- Layout persistence ----
-    void SetupDockingLayout();
     void SaveConfig();
     void LoadConfig();
+    void RefreshScriptList();
+
+    int  FindTabByPath(const std::string& path);
+    void OpenScriptInTab(const std::string& filename);
+    void RequestCloseTab(int index);
+    void ForceCloseTab(int index);
+    void SaveTab(int index);
+    bool HasUnsavedTabs();
+    void CreateNewTab();
 
     // ---- GLFW / ImGui state ----
     GLFWwindow* m_window = nullptr;
@@ -117,14 +75,48 @@ private:
     bool m_showDemoWindow = false;
     bool m_showMetrics = false;
 
-    // ---- Executer (Lua IDE) state ----
-    char m_luaInputBuffer[16384] = {};
+    // ---- Main tab navigation ----
+    int m_activeTab = 0; // 0=Executer, 1=Injector, 2=Logger, 3=Objects
+
+    // ---- Editor tab system ----
+    struct EditorTab {
+        std::string name;
+        std::string filePath;
+        std::vector<char> buffer;
+        bool isDirty = false;
+
+        EditorTab(const std::string& n = "Untitled", const std::string& fp = "")
+            : name(n), filePath(fp), buffer(16384, '\0') {}
+    };
+    std::vector<EditorTab> m_editorTabs;
+    int m_activeEditorTab = 0;
+    int m_untitledCounter = 1;
+
+    // ---- Script panel ----
+    char m_scriptSearchFilter[128] = {};
+    std::vector<std::string> m_scriptFiles;
+    int m_contextMenuScript = -1;
+
+    // ---- Resizable splitter state ----
+    float m_editorOutputSplit = 0.78f;
+    float m_scriptPanelWidth = 200.0f;
+
+    // ---- Console history ----
     std::vector<std::string> m_consoleHistory;
     int m_historyPos = -1;
-    std::string m_scriptPath = "scripts/level_check.lua";
+
+    // ---- Popup state ----
+    bool m_showSaveConfirm = false;
+    bool m_showNamePopup = false;
+    bool m_showDeleteConfirm = false;
+    bool m_showRenamePopup = false;
+    int  m_popupTargetTab = -1;
+    int  m_popupTargetScript = -1;
+    bool m_closingApp = false;
+    char m_nameBuffer[256] = {};
 
     // ---- Injector (privilege) state ----
-    int  m_privilegeTargetLevel = 8;
+    int  m_privilegeTargetLevel = 10;
     bool m_privilegeAutoElevate = true;
     bool m_privilegeBypassChecks = true;
 
