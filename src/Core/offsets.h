@@ -1,6 +1,10 @@
 #pragma once
 #include <cstdint>
 
+// version-145f189a6a974303
+// THIS IS AUTOMATIC AND ERRORS CAN OCCUR
+// Contact: contact@rbxoffsets.xyz
+
 namespace offsets {
     inline constexpr uintptr_t AbsolutePosition = 0xf8;
     inline constexpr uintptr_t AbsoluteRotation = 0x178;
@@ -74,7 +78,7 @@ namespace offsets {
     inline constexpr uintptr_t CharacterMeshMeshId = 0xf8;
     inline constexpr uintptr_t CharacterMeshOverlayTextureId = 0x128;
     inline constexpr uintptr_t Children = 0x70;
-    inline constexpr uintptr_t ChildrenEnd = 0x8;
+    inline constexpr uintptr_t ChildrenEnd = 0x78;
     inline constexpr uintptr_t ClassBase = 0x1b0;
     inline constexpr uintptr_t ClassDescriptor = 0x18;
     inline constexpr uintptr_t ClassDescriptorToClassName = 0x8;

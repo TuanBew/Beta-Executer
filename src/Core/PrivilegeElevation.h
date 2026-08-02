@@ -21,8 +21,45 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace Privilege {
+
+// ---- Route G: Runtime capture via debugger breakpoint ----
+//
+// Diagnostic tool for identifying which vtable slot is the per-frame
+// Step() function (called continuously) versus rarely-called accessors,
+// and what register (if any) holds a live ScriptContext-derived pointer
+// at that moment — used when static offset chasing (Paths A-F) can't
+// find ScriptContext anywhere in the objects it reaches.
+struct BreakpointHit {
+    uintptr_t address  = 0;
+    int       hitCount = 0;
+    // Register snapshot from the most recent hit at this address.
+    uint64_t rax = 0, rbx = 0, rcx = 0, rdx = 0, rsi = 0, rdi = 0, rbp = 0, rsp = 0;
+    uint64_t r8 = 0, r9 = 0, r10 = 0, r11 = 0, r12 = 0, r13 = 0, r14 = 0, r15 = 0;
+};
+
+// Attaches as the target's debugger, writes a single 0xCC byte at each
+// address in `addresses`, waits up to durationMs total for breakpoint
+// hits, restores all original bytes, detaches, and returns per-address
+// hit counts + last register snapshot in `results` (same order as input).
+// Any exception/event not caused by our own breakpoints is passed through
+// untouched (DBG_EXCEPTION_NOT_HANDLED) so the target's own handling isn't
+// disturbed. Returns false if the debugger attach itself failed.
+bool CaptureBreakpointHits(unsigned long pid, const std::vector<uintptr_t>& addresses,
+                           int durationMs, std::vector<BreakpointHit>& results);
+
+// ---- Route H: full read-only heap scan for a ScriptContext-classed object ----
+//
+// Walks every committed, private, readable region of the target's address
+// space directly (VirtualQueryEx/ReadProcessMemory) and tests every
+// plausible pointer value found in it for a ClassDescriptor->ClassName of
+// "ScriptContext". Makes no assumption about any global/offset chain being
+// correct — read-only, no debugger attach, no code patching. Bounded by
+// timeBudgetMs; returns false (not found or budget exceeded) or true with
+// outScriptContext set.
+bool ScanForScriptContext(uintptr_t& outScriptContext, int timeBudgetMs = 60000);
 
 struct ContextInfo {
     bool      attached         = false;
@@ -70,6 +107,14 @@ bool RemoveIdentityCheckDetour();
 // ---- Path C: VisualEngine Resolution ----
 
 uintptr_t ResolveDataModelPathC(uintptr_t moduleBase);
+
+// ---- Route D: ScriptContext via TaskQueue (bypasses DataModel) ----
+
+// (internal — called by ResolveContext)
+
+// ---- Route E: Parent-chain walk cross-validation ----
+
+// (internal — called by ResolveContext)
 
 // ---- Diagnostics ----
 

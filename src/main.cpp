@@ -42,13 +42,16 @@ static void PrintUsage() {
     printf("  Usage:\n");
     printf("    UniversalHub.exe                     Launch GUI control panel (default)\n");
     printf("    UniversalHub.exe --console           Launch text-based REPL\n");
-    printf("    UniversalHub.exe --attach <PID>      Auto-attach on startup\n\n");
+    printf("    UniversalHub.exe --attach <PID|name> Auto-attach on startup\n");
+    printf("    UniversalHub.exe --console --attach <PID|name> --run <script.lua>\n");
+    printf("                                          Headless: attach, run script, exit (no REPL/GUI)\n\n");
     printf("  Console Commands:\n");
     printf("    attach <process>   Attach to a process by name or PID\n");
     printf("    detach             Detach from current process\n");
     printf("    read <addr> <type> Read memory (type: i32, f32, u8, str)\n");
     printf("    write <addr> <val> Write memory (same types as read)\n");
     printf("    module <name>      Get base address of a module\n");
+    printf("    execute <path>     Run a Lua script file\n");
     printf("    bootstrap <dll>    Load DLL into target (educational demo)\n");
     printf("    help               Show this help\n");
     printf("    exit               Quit\n\n");
@@ -164,6 +167,17 @@ static void RunConsoleRepl() {
                 LOG_INFO("Module '%s' not found", args.c_str());
             }
         }
+        else if (cmd == "execute") {
+            if (args.empty()) {
+                LOG_WARN("Usage: execute <script_path>");
+                continue;
+            }
+            if (LuaBridge::GetInstance().ExecuteFile(args)) {
+                LOG_INFO("Script executed: %s", args.c_str());
+            } else {
+                LOG_ERROR("Script execution failed: %s", args.c_str());
+            }
+        }
         else if (cmd == "bootstrap") {
             if (args.empty()) {
                 LOG_WARN("Usage: bootstrap <dll_path>");
@@ -199,29 +213,53 @@ int main(int argc, char* argv[]) {
         LOG_WARN("[Main] LuaBridge failed to initialize — scripting will be unavailable");
     }
 
-    // ---- 4. Auto-attach via --attach flag ----
+    // ---- 4. Auto-attach via --attach flag (accepts PID or process name) ----
     // Note: Engine::AttachToProcess now calls Privilege::AutoElevateOnAttach() internally.
+    bool attached = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--attach" && i + 1 < argc) {
-            DWORD pid = std::stoul(argv[++i]);
-            if (Engine::GetInstance().AttachToProcess(pid)) {
-                LOG_INFO("Successfully attached to PID %lu", pid);
+            std::string target = argv[++i];
+            bool ok = false;
+            try {
+                DWORD pid = std::stoul(target);
+                ok = Engine::GetInstance().AttachToProcess(pid);
+            } catch (...) {
+                ok = Engine::GetInstance().AttachToProcess(target);
+            }
+            if (ok) {
+                LOG_INFO("Successfully attached to '%s'", target.c_str());
+                attached = true;
             } else {
-                LOG_ERROR("Failed to attach to PID %lu. Try running as Administrator.", pid);
+                LOG_ERROR("Failed to attach to '%s'. Try running as Administrator.", target.c_str());
             }
         }
     }
 
-    // ---- Determine mode: GUI (default) or console (--console flag) ----
+    // ---- Determine mode: GUI (default), console (--console), or headless one-shot (--run) ----
     bool useConsole = false;
+    std::string runScript;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--console") {
+        std::string a = argv[i];
+        if (a == "--console") {
             useConsole = true;
-            break;
+        } else if (a == "--run" && i + 1 < argc) {
+            runScript = argv[++i];
         }
     }
 
-    if (useConsole) {
+    if (!runScript.empty()) {
+        // ---- Headless one-shot: attach (already done above), run script, exit ----
+        // No REPL, no GUI — designed for scripted/automated CLI invocation.
+        if (!attached) {
+            LOG_WARN("[Main] --run given without a successful --attach — script will run unattached");
+        }
+        LOG_INFO("[Main] Headless run: executing '%s'", runScript.c_str());
+        if (LuaBridge::GetInstance().ExecuteFile(runScript)) {
+            LOG_INFO("[Main] Headless run complete: %s", runScript.c_str());
+        } else {
+            LOG_ERROR("[Main] Headless run failed: %s", runScript.c_str());
+        }
+    } else if (useConsole) {
         // ---- Legacy Console REPL ----
         RunConsoleRepl();
     } else {

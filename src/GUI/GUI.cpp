@@ -1133,34 +1133,41 @@ void GUI::RenderObjectsTab() {
                     if (realDM != 0) {
                         uintptr_t workspace = Memory::Read<uintptr_t>(realDM + offsets::Workspace);
                         if (workspace != 0) {
-                            uintptr_t child = Memory::Read<uintptr_t>(workspace + offsets::Children);
-                            const int kMaxScan = 500;
-                            for (int i = 0; i < kMaxScan && child != 0; ++i) {
-                                ObjectEntry entry{};
-                                entry.address = child;
-                                entry.name = Memory::ReadString(child + offsets::Name, 128);
+                            uintptr_t childStart = Memory::Read<uintptr_t>(workspace + offsets::Children);
+                            uintptr_t childEnd   = Memory::Read<uintptr_t>(workspace + offsets::Children + 0x8);
+                            const size_t kMaxScan = 500;
+                            size_t scanned = 0;
 
-                                uintptr_t cd = Memory::Read<uintptr_t>(child + offsets::ClassDescriptor);
-                                if (cd != 0) {
-                                    uintptr_t cnPtr = Memory::Read<uintptr_t>(cd + offsets::ClassDescriptorToClassName);
-                                    if (cnPtr != 0)
-                                        entry.className = Memory::ReadString(cnPtr, 64);
-                                }
+                            if (childStart != 0 && childEnd > childStart) {
+                                for (uintptr_t cur = childStart; cur < childEnd && scanned < kMaxScan;
+                                     cur += sizeof(uintptr_t), ++scanned) {
+                                    uintptr_t child = Memory::Read<uintptr_t>(cur);
+                                    if (child == 0) continue;
 
-                                if (!entry.name.empty()) {
-                                    m_cachedObjects.push_back(entry);
+                                    ObjectEntry entry{};
+                                    entry.address = child;
+                                    entry.name = Memory::ReadString(child + offsets::Name, 128);
 
-                                    if (entry.className == "RemoteEvent" ||
-                                        entry.className == "RemoteFunction") {
-                                        RemoteEntry re{};
-                                        re.name = entry.name;
-                                        re.type = entry.className;
-                                        re.address = entry.address;
-                                        m_cachedRemotes.push_back(re);
+                                    uintptr_t cd = Memory::Read<uintptr_t>(child + offsets::ClassDescriptor);
+                                    if (cd != 0) {
+                                        uintptr_t cnPtr = Memory::Read<uintptr_t>(cd + offsets::ClassDescriptorToClassName);
+                                        if (cnPtr != 0)
+                                            entry.className = Memory::ReadString(cnPtr, 64);
+                                    }
+
+                                    if (!entry.name.empty()) {
+                                        m_cachedObjects.push_back(entry);
+
+                                        if (entry.className == "RemoteEvent" ||
+                                            entry.className == "RemoteFunction") {
+                                            RemoteEntry re{};
+                                            re.name = entry.name;
+                                            re.type = entry.className;
+                                            re.address = entry.address;
+                                            m_cachedRemotes.push_back(re);
+                                        }
                                     }
                                 }
-
-                                child = Memory::Read<uintptr_t>(child + offsets::ChildrenEnd);
                             }
                         }
                     }

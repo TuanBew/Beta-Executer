@@ -85,22 +85,9 @@ static std::string ReadMSVCString(uintptr_t stringAddr) {
 static void DumpHex(uintptr_t address, size_t numBytes, const char* label) {
     LOG_INFO("[Privilege] === HexDump: %s @ 0x%llX (%zu bytes) ===",
              label, (unsigned long long)address, numBytes);
-    try {
-        auto bytes = Memory::ReadBytes(address, numBytes);
-        for (size_t off = 0; off < bytes.size(); off += 16) {
-            char hex[64] = {};
-            char ascii[20] = {};
-            size_t lineLen = (bytes.size() - off < 16) ? bytes.size() - off : 16;
-            for (size_t i = 0; i < lineLen; ++i) {
-                sprintf(hex + i * 3, "%02X ", bytes[off + i]);
-                ascii[i] = (bytes[off + i] >= 0x20 && bytes[off + i] < 0x7F)
-                           ? (char)bytes[off + i] : '.';
-            }
-            ascii[lineLen] = '\0';
-            LOG_INFO("[Privilege]   +0x%03X: %-48s  %s", (unsigned)off, hex, ascii);
-        }
-    } catch (const std::exception& e) {
-        LOG_WARN("[Privilege]   HexDump failed: %s", e.what());
+    std::string dump = Memory::HexDump(address, numBytes);
+    if (!dump.empty()) {
+        LOG_INFO("%s", dump.c_str());
     }
 }
 
@@ -180,7 +167,7 @@ static uintptr_t ResolveDataModelPathA(uintptr_t moduleBase) {
     try {
         uintptr_t sc = Memory::Read<uintptr_t>(dm + offsets::ScriptContext);
         uintptr_t childStart = Memory::Read<uintptr_t>(dm + offsets::Children);
-        uintptr_t childEnd   = Memory::Read<uintptr_t>(dm + offsets::Children + offsets::ChildrenEnd);
+        uintptr_t childEnd   = Memory::Read<uintptr_t>(dm + offsets::ChildrenEnd);
         if (sc == 0 && childEnd <= childStart) {
             LOG_WARN("[Privilege]   Path A: candidate is likely a proxy "
                      "(ScriptContext=null, children empty) — will try other paths");
@@ -249,11 +236,29 @@ static uintptr_t ResolveDataModelPathB(uintptr_t moduleBase) {
                 LOG_INFO("[Privilege]   found RenderJob '%s' @ 0x%llX", jobName.c_str(), (unsigned long long)jobPtr);
 
                 uintptr_t dm = Memory::Read<uintptr_t>(jobPtr + offsets::RenderJobRealDataModel);
-                if (dm != 0 && IsValidPointer(dm)) {
-                    LOG_INFO("[Privilege]   Path B: DataModel = 0x%llX", (unsigned long long)dm);
-                    return dm;
+                if (dm == 0 || !IsValidPointer(dm)) {
+                    LOG_WARN("[Privilege]   RenderJob DataModel 0x%llX invalid", (unsigned long long)dm);
+                    continue;
                 }
-                LOG_WARN("[Privilege]   RenderJob DataModel 0x%llX invalid", (unsigned long long)dm);
+
+                std::string cn = ReadClassName(dm);
+                LOG_INFO("[Privilege]   Path B candidate: 0x%llX ClassName='%s'", (unsigned long long)dm, cn.c_str());
+                if (cn.empty() || cn.find("DataModel") == std::string::npos) {
+                    LOG_WARN("[Privilege]   Path B: ClassName '%s' is not DataModel — rejected", cn.c_str());
+                    continue;
+                }
+
+                uintptr_t childStart = Memory::Read<uintptr_t>(dm + offsets::Children);
+                uintptr_t childEnd   = Memory::Read<uintptr_t>(dm + offsets::Children + 0x8);
+                if (!IsValidPointer(childStart) || !IsValidPointer(childEnd) || childEnd <= childStart) {
+                    LOG_WARN("[Privilege]   Path B: Children invalid (start=0x%llX end=0x%llX) — rejected",
+                             (unsigned long long)childStart, (unsigned long long)childEnd);
+                    continue;
+                }
+
+                LOG_INFO("[Privilege]   Path B: DataModel validated @ 0x%llX (children: %zu entries)",
+                         (unsigned long long)dm, (size_t)(childEnd - childStart) / sizeof(uintptr_t));
+                return dm;
             }
         } catch (...) { continue; }
     }
@@ -318,6 +323,209 @@ uintptr_t ResolveDataModelPathC(uintptr_t moduleBase) {
     return 0;
 }
 
+// ============================================================
+//  Route F: RenderView chain (previously-unused offsets pulled from
+//  the auto-generated offset dump — never wired into resolution
+//  logic before). Spot-checked against a live hex dump before use:
+//  RenderJob+0x38 (RenderJobFakeDataModel) read back
+//  FakeDataModel+0x8 from the very same capture where Path A
+//  independently resolved FakeDataModel, confirming this offset
+//  cluster is legitimate and simply unused, not another guess.
+// ============================================================
+static uintptr_t ResolveDataModelViaRenderView(uintptr_t moduleBase) {
+    LOG_INFO("[Privilege] Route F: RenderView chain");
+
+    auto tryRenderView = [](uintptr_t renderView, const std::string& source) -> uintptr_t {
+        if (renderView == 0 || !IsValidPointer(renderView)) return static_cast<uintptr_t>(0);
+        LOG_INFO("[Privilege]   Route F: RenderView candidate @ 0x%llX (via %s)",
+                 (unsigned long long)renderView, source.c_str());
+        DumpHex(renderView, 512, "Route F RenderView object");
+
+        uintptr_t fakeDM2 = 0;
+        try { fakeDM2 = Memory::Read<uintptr_t>(renderView + offsets::FakeDataModel); }
+        catch (const std::exception& e) {
+            LOG_WARN("[Privilege]   Route F: RenderView+0x%llX (FakeDataModel) read FAILED: %s",
+                     (unsigned long long)offsets::FakeDataModel, e.what());
+            return static_cast<uintptr_t>(0);
+        }
+        LOG_INFO("[Privilege]   Route F: RenderView+0x%llX (FakeDataModel) = 0x%llX",
+                 (unsigned long long)offsets::FakeDataModel, (unsigned long long)fakeDM2);
+        if (!IsValidPointer(fakeDM2)) {
+            LOG_WARN("[Privilege]   Route F: FakeDataModel2 0x%llX invalid", (unsigned long long)fakeDM2);
+            return static_cast<uintptr_t>(0);
+        }
+
+        uintptr_t dm2 = 0;
+        try { dm2 = Memory::Read<uintptr_t>(fakeDM2 + offsets::FakeDataModelToDataModel); }
+        catch (const std::exception& e) {
+            LOG_WARN("[Privilege]   Route F: FakeDataModel2+0x%llX (ToDataModel) read FAILED: %s",
+                     (unsigned long long)offsets::FakeDataModelToDataModel, e.what());
+            return static_cast<uintptr_t>(0);
+        }
+        LOG_INFO("[Privilege]   Route F: FakeDataModel2+0x%llX (ToDataModel) = 0x%llX",
+                 (unsigned long long)offsets::FakeDataModelToDataModel, (unsigned long long)dm2);
+        if (!IsValidPointer(dm2)) {
+            LOG_WARN("[Privilege]   Route F: DataModel2 0x%llX invalid", (unsigned long long)dm2);
+            return static_cast<uintptr_t>(0);
+        }
+
+        std::string cn = ReadClassName(dm2);
+        LOG_INFO("[Privilege]   Route F: candidate DataModel @ 0x%llX class='%s'",
+                 (unsigned long long)dm2, cn.c_str());
+        return (cn.find("DataModel") != std::string::npos) ? dm2 : static_cast<uintptr_t>(0);
+    };
+
+    uintptr_t veContainer = 0;
+    try { veContainer = Memory::Read<uintptr_t>(moduleBase + offsets::VisualEnginePointer); } catch (...) {}
+    if (veContainer != 0 && IsValidPointer(veContainer)) {
+        uintptr_t rv = 0;
+        try { rv = Memory::Read<uintptr_t>(veContainer + offsets::RenderView); } catch (...) {}
+        uintptr_t result = tryRenderView(rv, "VisualEngine+RenderView");
+        if (result != 0) return result;
+    }
+
+    uintptr_t tsPtr = 0;
+    try { tsPtr = Memory::Read<uintptr_t>(moduleBase + offsets::TaskSchedulerPointer); } catch (...) {}
+    if (tsPtr != 0 && IsValidPointer(tsPtr)) {
+        uintptr_t jobStart = 0, jobEnd = 0;
+        try {
+            jobStart = Memory::Read<uintptr_t>(tsPtr + offsets::JobStart);
+            jobEnd   = Memory::Read<uintptr_t>(tsPtr + offsets::JobEnd);
+        } catch (...) {}
+        if (IsValidPointer(jobStart) && IsValidPointer(jobEnd) && jobEnd > jobStart) {
+            size_t count = 0;
+            for (uintptr_t cur = jobStart; cur < jobEnd && count < 256; cur += sizeof(uintptr_t), ++count) {
+                try {
+                    uintptr_t jobPtr = Memory::Read<uintptr_t>(cur);
+                    if (!IsValidPointer(jobPtr)) continue;
+                    std::string jobName = ReadMSVCString(jobPtr + offsets::Job_Name);
+                    std::string lower = jobName;
+                    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                    if (lower.find("render") == std::string::npos) continue;
+
+                    uintptr_t rv = Memory::Read<uintptr_t>(jobPtr + offsets::RenderJobRenderView);
+                    uintptr_t result = tryRenderView(rv, "RenderJob:" + jobName);
+                    if (result != 0) return result;
+                } catch (...) { continue; }
+            }
+        }
+    }
+
+    LOG_WARN("[Privilege]   Route F: no DataModel found via RenderView chain");
+    return 0;
+}
+
+// ============================================================
+//  Route D: ScriptContextTaskQueue → ScriptContext (direct)
+// ============================================================
+
+static uintptr_t ResolveScriptContextViaTaskQueue(uintptr_t moduleBase) {
+    LOG_INFO("[Privilege] Route D: ScriptContextTaskQueue back-pointer scan");
+
+    uintptr_t tsPtrAddr = moduleBase + offsets::TaskSchedulerPointer;
+    uintptr_t tsPtr = 0;
+    try { tsPtr = Memory::Read<uintptr_t>(tsPtrAddr); } catch (...) { return 0; }
+    if (tsPtr == 0 || !IsValidPointer(tsPtr)) return 0;
+
+    uintptr_t jobStart = 0, jobEnd = 0;
+    try {
+        jobStart = Memory::Read<uintptr_t>(tsPtr + offsets::JobStart);
+        jobEnd   = Memory::Read<uintptr_t>(tsPtr + offsets::JobEnd);
+    } catch (...) { return 0; }
+    if (!IsValidPointer(jobStart) || !IsValidPointer(jobEnd) || jobEnd <= jobStart) return 0;
+
+    // Brute-force scan every 8-byte-aligned field in the job object instead
+    // of a fixed offset list — per-build layout drift (confirmed via live
+    // hex dumps) makes a hardcoded probe list unreliable.
+    const uintptr_t scanRange = 0x300;
+
+    size_t count = 0;
+    for (uintptr_t cur = jobStart; cur < jobEnd && count < 256; cur += sizeof(uintptr_t), ++count) {
+        try {
+            uintptr_t jobPtr = Memory::Read<uintptr_t>(cur);
+            if (!IsValidPointer(jobPtr)) continue;
+
+            std::string jobName = ReadMSVCString(jobPtr + offsets::Job_Name);
+            std::string lower = jobName;
+            std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+            if (lower.find("scriptcontext") == std::string::npos) continue;
+
+            LOG_INFO("[Privilege]   Route D: found job '%s' @ 0x%llX — scanning +0x0..0x%llX for ScriptContext pointer",
+                     jobName.c_str(), (unsigned long long)jobPtr, (unsigned long long)scanRange);
+
+            for (uintptr_t off = 0; off < scanRange; off += sizeof(uintptr_t)) {
+                try {
+                    uintptr_t candidate = Memory::Read<uintptr_t>(jobPtr + off);
+                    if (candidate == 0 || !IsValidPointer(candidate)) continue;
+
+                    std::string cn = ReadClassName(candidate);
+                    if (cn == "ScriptContext") {
+                        LOG_INFO("[Privilege]   Route D: ScriptContext @ 0x%llX via job+0x%llX",
+                                 (unsigned long long)candidate, (unsigned long long)off);
+                        return candidate;
+                    }
+                } catch (...) { continue; }
+            }
+
+            LOG_WARN("[Privilege]   Route D: job '%s' found but no ScriptContext pointer in scanned range",
+                     jobName.c_str());
+        } catch (...) { continue; }
+    }
+
+    LOG_WARN("[Privilege]   Route D: no ScriptContextTaskQueue job found");
+    return 0;
+}
+
+// ============================================================
+//  Route E: Parent-chain walk (any valid child → root DataModel)
+// ============================================================
+
+static uintptr_t ResolveDataModelViaParentWalk(uintptr_t candidateDM) {
+    LOG_INFO("[Privilege] Route E: parent-chain walk from candidate 0x%llX",
+             (unsigned long long)candidateDM);
+
+    uintptr_t childStart = 0, childEnd = 0;
+    try {
+        childStart = Memory::Read<uintptr_t>(candidateDM + offsets::Children);
+        childEnd   = Memory::Read<uintptr_t>(candidateDM + offsets::Children + 0x8);
+    } catch (...) { return 0; }
+
+    if (!IsValidPointer(childStart) || !IsValidPointer(childEnd) || childEnd <= childStart)
+        return 0;
+
+    uintptr_t firstChild = 0;
+    try { firstChild = Memory::Read<uintptr_t>(childStart); } catch (...) { return 0; }
+    if (!IsValidPointer(firstChild)) return 0;
+
+    uintptr_t current = firstChild;
+    for (int depth = 0; depth < 32; ++depth) {
+        uintptr_t parent = 0;
+        try { parent = Memory::Read<uintptr_t>(current + offsets::Parent); } catch (...) { break; }
+        if (parent == 0 || !IsValidPointer(parent) || parent == current) {
+            std::string cn = ReadClassName(current);
+            if (!cn.empty() && cn.find("DataModel") != std::string::npos) {
+                LOG_INFO("[Privilege]   Route E: root DataModel @ 0x%llX (depth %d, class='%s')",
+                         (unsigned long long)current, depth, cn.c_str());
+                return current;
+            }
+            break;
+        }
+        current = parent;
+    }
+
+    std::string cn = ReadClassName(current);
+    if (!cn.empty() && cn.find("DataModel") != std::string::npos) {
+        LOG_INFO("[Privilege]   Route E: DataModel @ 0x%llX via parent chain (class='%s')",
+                 (unsigned long long)current, cn.c_str());
+        return current;
+    }
+
+    LOG_WARN("[Privilege]   Route E: parent walk ended at 0x%llX (class='%s') — not DataModel",
+             (unsigned long long)current, cn.c_str());
+    return 0;
+}
+
 uintptr_t ResolveDataModel(uintptr_t moduleBase, std::string& pathUsed) {
     uintptr_t dm = ResolveDataModelPathA(moduleBase);
     if (dm != 0) { pathUsed = "PathA"; return dm; }
@@ -341,7 +549,7 @@ bool ResolveScriptContextViaChildren(uintptr_t dataModel, uintptr_t& outScriptCo
 
     try {
         uintptr_t childPtr = Memory::Read<uintptr_t>(dataModel + offsets::Children);
-        uintptr_t childEnd = Memory::Read<uintptr_t>(dataModel + offsets::Children + offsets::ChildrenEnd);
+        uintptr_t childEnd = Memory::Read<uintptr_t>(dataModel + offsets::ChildrenEnd);
 
         LOG_INFO("[Privilege]   Children start=0x%llX end=0x%llX",
                  (unsigned long long)childPtr, (unsigned long long)childEnd);
@@ -387,6 +595,48 @@ bool ResolveScriptContextViaChildren(uintptr_t dataModel, uintptr_t& outScriptCo
 }
 
 // ============================================================
+//  ScriptContext Fallback via Brute-Force Field Scan
+// ============================================================
+//
+// When neither the fixed ScriptContext offset nor the Children array walk
+// finds it, scan every 8-byte-aligned field within the DataModel object
+// itself for a pointer whose class resolves to "ScriptContext". Live hex
+// dumps of the candidate DataModel showed neither +0x440 nor +0x70/+0x78
+// hold what we expect for this build, so a fixed offset is unreliable —
+// let the object's own validated pointers self-identify instead.
+static bool ResolveScriptContextViaScan(uintptr_t dataModel, uintptr_t& outScriptContext, uintptr_t& outOffset) {
+    const uintptr_t scanRange = 0x800;
+    LOG_INFO("[Privilege]   Field scan: scanning DataModel+0x0..0x%llX for a ScriptContext pointer",
+             (unsigned long long)scanRange);
+
+    for (uintptr_t off = 0; off < scanRange; off += sizeof(uintptr_t)) {
+        uintptr_t candidate = 0;
+        try {
+            candidate = Memory::Read<uintptr_t>(dataModel + off);
+        } catch (...) { continue; }
+
+        if (!IsValidPointer(candidate)) continue;
+
+        std::string cn;
+        try {
+            cn = ReadClassName(candidate);
+        } catch (...) { continue; }
+
+        if (cn == "ScriptContext") {
+            LOG_INFO("[Privilege]   Field scan: FOUND ScriptContext @ 0x%llX via DataModel+0x%llX",
+                     (unsigned long long)candidate, (unsigned long long)off);
+            outScriptContext = candidate;
+            outOffset = off;
+            return true;
+        }
+    }
+
+    LOG_WARN("[Privilege]   Field scan: no ScriptContext pointer found in DataModel+0x0..0x%llX",
+             (unsigned long long)scanRange);
+    return false;
+}
+
+// ============================================================
 //  Pointer Chain Resolution (v2.1 — try all DataModel paths)
 // ============================================================
 
@@ -414,6 +664,16 @@ static bool TryResolveScriptContext(uintptr_t dataModel, uintptr_t& outSC, std::
         return true;
     }
 
+    LOG_INFO("[Privilege] Children walk failed — trying brute-force field scan");
+    uintptr_t scScan = 0, scanOffset = 0;
+    if (ResolveScriptContextViaScan(dataModel, scScan, scanOffset)) {
+        outSC = scScan;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "+FieldScan@0x%llX", (unsigned long long)scanOffset);
+        pathSuffix = buf;
+        return true;
+    }
+
     return false;
 }
 
@@ -437,9 +697,16 @@ bool ResolveContext(ContextInfo& out) {
     LOG_INFO("[Privilege] === Chain resolution START (moduleBase=0x%llX) ===",
              (unsigned long long)out.moduleBase);
 
+    // Best-effort: expose FakeDataModel regardless of overall outcome so
+    // diagnostic tools (research_dump.lua) can inspect it even when the
+    // full chain doesn't resolve. This mirrors step 1 of ResolveDataModelPathA.
+    try {
+        out.fakeDataModel = Memory::Read<uintptr_t>(out.moduleBase + offsets::FakeDataModelPointer);
+    } catch (...) {}
+
     // Collect DataModel candidates from all paths (don't short-circuit)
     struct DMCandidate { uintptr_t addr; std::string path; };
-    DMCandidate candidates[3];
+    DMCandidate candidates[8];
     int nCandidates = 0;
 
     out.pathATried = true;
@@ -454,14 +721,57 @@ bool ResolveContext(ContextInfo& out) {
     uintptr_t dmC = ResolveDataModelPathC(out.moduleBase);
     if (dmC != 0) candidates[nCandidates++] = { dmC, "PathC" };
 
+    uintptr_t dmF = ResolveDataModelViaRenderView(out.moduleBase);
+    if (dmF != 0) candidates[nCandidates++] = { dmF, "RouteF" };
+
     out.candidateCount = nCandidates;
 
+    // Route E: try parent-chain walk on any candidate with valid children
+    for (int i = 0; i < nCandidates; ++i) {
+        uintptr_t crossValidated = ResolveDataModelViaParentWalk(candidates[i].addr);
+        if (crossValidated != 0 && crossValidated != candidates[i].addr) {
+            LOG_INFO("[Privilege] Route E cross-validated: candidate %s 0x%llX → real DataModel 0x%llX",
+                     candidates[i].path.c_str(),
+                     (unsigned long long)candidates[i].addr,
+                     (unsigned long long)crossValidated);
+            candidates[nCandidates++] = { crossValidated, candidates[i].path + "+ParentWalk" };
+        }
+    }
+
     if (nCandidates == 0) {
+        // Route D: try to find ScriptContext directly, bypassing DataModel
+        uintptr_t scDirect = ResolveScriptContextViaTaskQueue(out.moduleBase);
+        if (scDirect != 0) {
+            LOG_INFO("[Privilege] Route D: direct ScriptContext @ 0x%llX — walking parent for DataModel",
+                     (unsigned long long)scDirect);
+            out.scriptContext = scDirect;
+            out.resolutionPath = "RouteD";
+
+            uintptr_t parent = 0;
+            try { parent = Memory::Read<uintptr_t>(scDirect + offsets::Parent); } catch (...) {}
+            if (parent != 0 && IsValidPointer(parent)) {
+                std::string cn = ReadClassName(parent);
+                if (!cn.empty() && cn.find("DataModel") != std::string::npos) {
+                    out.dataModel = parent;
+                    LOG_INFO("[Privilege] Route D: DataModel via ScriptContext.Parent = 0x%llX",
+                             (unsigned long long)parent);
+                }
+            }
+
+            try {
+                out.currentLevel = Memory::Read<int>(scDirect + offsets::ScriptContextIdentityLevel);
+            } catch (...) {}
+
+            LOG_INFO("[Privilege] === Chain resolution SUCCESS (path=RouteD) ===");
+            return true;
+        }
+
         out.lastError = "All DataModel resolution paths failed";
         LOG_ERROR("[Privilege] %s", out.lastError.c_str());
         return false;
     }
 
+    out.candidateCount = nCandidates;
     LOG_INFO("[Privilege] %d DataModel candidate(s) found", nCandidates);
 
     // Try ScriptContext resolution on each candidate until one works
@@ -501,6 +811,64 @@ bool ResolveContext(ContextInfo& out) {
 
         LOG_WARN("[Privilege] ScriptContext not found via %s — trying next candidate",
                  candidates[i].path.c_str());
+    }
+
+    // Last resort: Route D direct ScriptContext even when DataModel candidates exist
+    uintptr_t scFallback = ResolveScriptContextViaTaskQueue(out.moduleBase);
+    if (scFallback != 0) {
+        out.scriptContext  = scFallback;
+        out.resolutionPath = "RouteD-fallback";
+
+        uintptr_t parent = 0;
+        try { parent = Memory::Read<uintptr_t>(scFallback + offsets::Parent); } catch (...) {}
+        if (parent != 0 && IsValidPointer(parent)) {
+            std::string cn = ReadClassName(parent);
+            if (!cn.empty() && cn.find("DataModel") != std::string::npos)
+                out.dataModel = parent;
+        }
+
+        try {
+            out.currentLevel = Memory::Read<int>(scFallback + offsets::ScriptContextIdentityLevel);
+        } catch (...) {}
+
+        LOG_INFO("[Privilege] === Chain resolution SUCCESS (path=RouteD-fallback, SC=0x%llX) ===",
+                 (unsigned long long)scFallback);
+        return true;
+    }
+
+    // Route H: full read-only heap scan, independent of every pointer chain
+    // tried above. All of A-F/D converge on the same FakeDataModel-derived
+    // decoy (verified: DataModel-classed, but permanently null ScriptContext
+    // and empty/reversed children — a genuine proxy object, not a misread).
+    // This route makes no assumption about that global at all.
+    LOG_INFO("[Privilege] All chain-based routes exhausted — trying Route H (heap scan)");
+    uintptr_t scScan = 0;
+    if (ScanForScriptContext(scScan, 20000)) {
+        out.scriptContext  = scScan;
+        out.resolutionPath = "RouteH-heapscan";
+
+        uintptr_t parent = 0;
+        try { parent = Memory::Read<uintptr_t>(scScan + offsets::Parent); } catch (...) {}
+        if (parent != 0 && IsValidPointer(parent)) {
+            std::string cn = ReadClassName(parent);
+            if (!cn.empty() && cn.find("DataModel") != std::string::npos)
+                out.dataModel = parent;
+        }
+
+        try {
+            out.currentLevel = Memory::Read<int>(scScan + offsets::ScriptContextIdentityLevel);
+        } catch (...) {}
+
+        LOG_INFO("[Privilege] === Chain resolution SUCCESS (path=RouteH-heapscan, SC=0x%llX) ===",
+                 (unsigned long long)scScan);
+        return true;
+    }
+
+    // Best-effort: expose the first candidate even though the chain never
+    // fully resolved, so diagnostics can hex-dump it and find the real
+    // offsets instead of guessing blind.
+    if (nCandidates > 0) {
+        out.dataModel = candidates[0].addr;
     }
 
     out.lastError = "ScriptContext not found on any DataModel candidate";
@@ -587,7 +955,125 @@ void RunDiagnostics() {
         LOG_WARN("[Privilege]   TaskScheduler diagnostic failed: %s", e.what());
     }
 
-    // 3. VisualEngine
+    // 3. ScriptContextTaskQueue probe (Route D diagnostics)
+    try {
+        uintptr_t tsPtr = Memory::Read<uintptr_t>(base + offsets::TaskSchedulerPointer);
+        if (tsPtr != 0 && IsValidPointer(tsPtr)) {
+            uintptr_t jobStart = Memory::Read<uintptr_t>(tsPtr + offsets::JobStart);
+            uintptr_t jobEnd   = Memory::Read<uintptr_t>(tsPtr + offsets::JobEnd);
+            if (IsValidPointer(jobStart) && IsValidPointer(jobEnd) && jobEnd > jobStart) {
+                size_t count = 0;
+                for (uintptr_t cur = jobStart; cur < jobEnd && count < 256;
+                     cur += sizeof(uintptr_t), ++count) {
+                    uintptr_t jobPtr = Memory::Read<uintptr_t>(cur);
+                    if (!IsValidPointer(jobPtr)) continue;
+                    std::string name = ReadMSVCString(jobPtr + offsets::Job_Name);
+                    std::string lower = name;
+                    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                    if (lower.find("scriptcontext") != std::string::npos) {
+                        LOG_INFO("[Privilege]   ScriptContextTaskQueue job #%zu '%s' @ 0x%llX",
+                                 count, name.c_str(), (unsigned long long)jobPtr);
+                        DumpHex(jobPtr, 512, "ScriptContextTaskQueue job");
+
+                        const uintptr_t probes[] = { 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x48,
+                                                     0x1C8, 0x1D0, 0x1D8, 0x1E0 };
+                        for (uintptr_t off : probes) {
+                            uintptr_t val = Memory::Read<uintptr_t>(jobPtr + off);
+                            if (val != 0 && IsValidPointer(val)) {
+                                std::string cn = ReadClassName(val);
+                                LOG_INFO("[Privilege]     +0x%llX → 0x%llX class='%s'",
+                                         (unsigned long long)off, (unsigned long long)val, cn.c_str());
+                            }
+                        }
+
+                        // Vtable dump — read-only, for identifying a runtime-hook
+                        // candidate (a virtual "step"/"execute" function that the
+                        // TaskScheduler calls every frame). Entries within the
+                        // module's address range are real code pointers; entries
+                        // far from moduleBase are either data or garbage.
+                        std::vector<uintptr_t> inModuleSlots;
+                        try {
+                            uintptr_t vtable = Memory::Read<uintptr_t>(jobPtr + 0x0);
+                            if (IsValidPointer(vtable)) {
+                                LOG_INFO("[Privilege]   vtable @ 0x%llX (moduleBase=0x%llX, delta shown per slot):",
+                                         (unsigned long long)vtable, (unsigned long long)base);
+                                for (int slot = 0; slot < 16; ++slot) {
+                                    uintptr_t fn = 0;
+                                    try { fn = Memory::Read<uintptr_t>(vtable + slot * sizeof(uintptr_t)); }
+                                    catch (...) { continue; }
+                                    if (fn == 0 || !IsValidPointer(fn)) continue;
+                                    bool inModule = (fn >= base && fn < base + 0x10000000ULL);
+                                    LOG_INFO("[Privilege]     slot[%d] = 0x%llX%s (moduleBase+0x%llX)",
+                                             slot, (unsigned long long)fn,
+                                             inModule ? "" : " [outside module range]",
+                                             inModule ? (unsigned long long)(fn - base) : 0);
+                                    if (inModule) inModuleSlots.push_back(fn);
+                                }
+                            } else {
+                                LOG_WARN("[Privilege]   vtable pointer 0x%llX invalid", (unsigned long long)vtable);
+                            }
+                        } catch (const std::exception& e) {
+                            LOG_WARN("[Privilege]   vtable dump failed: %s", e.what());
+                        }
+
+                        // Route G: breakpoint every in-module vtable slot for a
+                        // bounded window. The TaskScheduler calls Step() every
+                        // frame, so it should fire quickly; rarely-called
+                        // accessors may not fire at all in the window. For each
+                        // hit, scan all 16 general-purpose registers for a
+                        // pointer whose ClassDescriptor chain resolves to
+                        // "ScriptContext".
+                        char routeGFlag[8] = {};
+                        bool routeGEnabled = GetEnvironmentVariableA("UHUB_ENABLE_ROUTE_G", routeGFlag, sizeof(routeGFlag)) > 0
+                                             && routeGFlag[0] == '1';
+                        if (!routeGEnabled) {
+                            LOG_INFO("[Privilege]   Route G: skipped (opt-in only — set UHUB_ENABLE_ROUTE_G=1 to run; "
+                                     "this technique attaches a debugger and live-patches code, and previously crashed the target)");
+                        } else if (!inModuleSlots.empty()) {
+                            LOG_INFO("[Privilege]   Route G: arming %zu vtable slot(s), capturing for 4000ms...",
+                                     inModuleSlots.size());
+                            std::vector<BreakpointHit> hits;
+                            DWORD targetPid = Engine::GetInstance().GetPid();
+                            if (CaptureBreakpointHits(targetPid, inModuleSlots, 4000, hits)) {
+                                for (const auto& hit : hits) {
+                                    if (hit.hitCount == 0) {
+                                        LOG_INFO("[Privilege]   Route G: slot @ 0x%llX — no hits in window",
+                                                 (unsigned long long)hit.address);
+                                        continue;
+                                    }
+                                    LOG_INFO("[Privilege]   Route G: slot @ 0x%llX HIT %d time(s)",
+                                             (unsigned long long)hit.address, hit.hitCount);
+                                    const std::pair<const char*, uint64_t> regs[] = {
+                                        {"rax", hit.rax}, {"rbx", hit.rbx}, {"rcx", hit.rcx}, {"rdx", hit.rdx},
+                                        {"rsi", hit.rsi}, {"rdi", hit.rdi}, {"rbp", hit.rbp}, {"rsp", hit.rsp},
+                                        {"r8",  hit.r8},  {"r9",  hit.r9},  {"r10", hit.r10}, {"r11", hit.r11},
+                                        {"r12", hit.r12}, {"r13", hit.r13}, {"r14", hit.r14}, {"r15", hit.r15},
+                                    };
+                                    for (const auto& reg : regs) {
+                                        uintptr_t val = (uintptr_t)reg.second;
+                                        if (!IsValidPointer(val)) continue;
+                                        std::string cn;
+                                        try { cn = ReadClassName(val); } catch (...) { continue; }
+                                        if (!cn.empty()) {
+                                            LOG_INFO("[Privilege]     %s = 0x%llX class='%s'%s",
+                                                     reg.first, (unsigned long long)val, cn.c_str(),
+                                                     cn == "ScriptContext" ? "  <<< MATCH" : "");
+                                        }
+                                    }
+                                }
+                            } else {
+                                LOG_WARN("[Privilege]   Route G: capture failed (debugger attach issue?)");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        LOG_WARN("[Privilege]   ScriptContextTaskQueue diagnostic failed: %s", e.what());
+    }
+
+    // 4. VisualEngine
     try {
         uintptr_t veContainer = Memory::Read<uintptr_t>(base + offsets::VisualEnginePointer);
         if (veContainer != 0 && IsValidPointer(veContainer)) {
@@ -601,6 +1087,25 @@ void RunDiagnostics() {
         }
     } catch (const std::exception& e) {
         LOG_WARN("[Privilege]   VisualEngine diagnostic failed: %s", e.what());
+    }
+
+    // 5. Route D direct probe result
+    uintptr_t scDirect = ResolveScriptContextViaTaskQueue(base);
+    if (scDirect != 0) {
+        LOG_INFO("[Privilege]   Route D: ScriptContext found @ 0x%llX", (unsigned long long)scDirect);
+        DumpHex(scDirect, 512, "Route D ScriptContext");
+        try {
+            int level = Memory::Read<int>(scDirect + offsets::ScriptContextIdentityLevel);
+            LOG_INFO("[Privilege]   Route D: identity level = %d", level);
+        } catch (...) {}
+        try {
+            uintptr_t parent = Memory::Read<uintptr_t>(scDirect + offsets::Parent);
+            if (parent != 0 && IsValidPointer(parent)) {
+                std::string cn = ReadClassName(parent);
+                LOG_INFO("[Privilege]   Route D: ScriptContext.Parent = 0x%llX class='%s'",
+                         (unsigned long long)parent, cn.c_str());
+            }
+        } catch (...) {}
     }
 
     LOG_INFO("[Privilege] ============ DIAGNOSTICS END ============");
@@ -874,6 +1379,275 @@ int ElevateWithRetry(int targetLevel, bool useDetour, int maxRetries, int delayM
 
     LOG_ERROR("[Privilege] All %d elevation attempts exhausted", maxRetries);
     return 0;
+}
+
+// ============================================================
+//  Route G: Runtime Capture via Debugger Breakpoint
+// ============================================================
+//
+// Static offset chasing (Paths A-F) consistently reaches objects that
+// validate structurally but never contain a ScriptContext pointer in any
+// scanned range. This attaches as the target's debugger, patches a
+// handful of candidate vtable-slot functions with a single INT3 byte,
+// and records which slot fires (and how often) plus a full register
+// snapshot at the moment of each hit — letting the *running* code show
+// us where the pointer actually lives instead of guessing more static
+// offsets. Each breakpoint is removed permanently after its first hit
+// (one confirmed sample per slot is enough for this diagnostic), and any
+// exception that isn't one of our own breakpoints is passed through
+// untouched so the target's own exception handling is never disturbed.
+bool CaptureBreakpointHits(unsigned long pid, const std::vector<uintptr_t>& addresses,
+                           int durationMs, std::vector<BreakpointHit>& results) {
+    results.clear();
+    for (uintptr_t addr : addresses) {
+        BreakpointHit hit;
+        hit.address = addr;
+        results.push_back(hit);
+    }
+
+    if (addresses.empty()) {
+        LOG_WARN("[Privilege] CaptureBreakpointHits: no addresses given");
+        return false;
+    }
+
+    if (!DebugActiveProcess(pid)) {
+        LOG_ERROR("[Privilege] CaptureBreakpointHits: DebugActiveProcess failed (err=%lu) — "
+                  "target may already have a debugger attached", GetLastError());
+        return false;
+    }
+    DebugSetProcessKillOnExit(FALSE);
+    LOG_INFO("[Privilege] CaptureBreakpointHits: attached as debugger to pid %lu", pid);
+
+    std::vector<uint8_t> originalBytes(addresses.size(), 0);
+    std::vector<bool> armed(addresses.size(), false);
+    bool anyArmed = false;
+
+    for (size_t i = 0; i < addresses.size(); ++i) {
+        try {
+            originalBytes[i] = Memory::Read<uint8_t>(addresses[i]);
+            Memory::Write<uint8_t>(addresses[i], 0xCC);
+            if (Memory::Read<uint8_t>(addresses[i]) == 0xCC) {
+                armed[i] = true;
+                anyArmed = true;
+                LOG_INFO("[Privilege]   armed breakpoint @ 0x%llX (was 0x%02X)",
+                         (unsigned long long)addresses[i], originalBytes[i]);
+            } else {
+                LOG_WARN("[Privilege]   breakpoint @ 0x%llX failed verification",
+                         (unsigned long long)addresses[i]);
+            }
+        } catch (const std::exception& e) {
+            LOG_WARN("[Privilege]   could not arm breakpoint @ 0x%llX: %s",
+                     (unsigned long long)addresses[i], e.what());
+        }
+    }
+
+    if (!anyArmed) {
+        LOG_ERROR("[Privilege] CaptureBreakpointHits: no breakpoints armed — detaching");
+        DebugActiveProcessStop(pid);
+        return false;
+    }
+
+    auto addrIndex = [&](uintptr_t a) -> int {
+        for (size_t i = 0; i < addresses.size(); ++i)
+            if (addresses[i] == a) return (int)i;
+        return -1;
+    };
+
+    HANDLE hProcess = Engine::GetInstance().GetProcessHandle();
+    ULONGLONG startTick = GetTickCount64();
+    bool targetExited = false;
+
+    while (!targetExited) {
+        ULONGLONG elapsed = GetTickCount64() - startTick;
+        if (elapsed >= (ULONGLONG)durationMs) break;
+
+        DEBUG_EVENT de{};
+        DWORD waitMs = (DWORD)std::min<ULONGLONG>(200, (ULONGLONG)durationMs - elapsed);
+        if (!WaitForDebugEvent(&de, waitMs)) continue;
+
+        DWORD continueStatus = DBG_CONTINUE;
+
+        if (de.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT) {
+            targetExited = true;
+        } else if (de.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT) {
+            if (de.u.CreateProcessInfo.hFile) CloseHandle(de.u.CreateProcessInfo.hFile);
+        } else if (de.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT) {
+            if (de.u.LoadDll.hFile) CloseHandle(de.u.LoadDll.hFile);
+        } else if (de.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
+            const auto& rec = de.u.Exception.ExceptionRecord;
+            uintptr_t exAddr = (uintptr_t)rec.ExceptionAddress;
+            int idx = (rec.ExceptionCode == EXCEPTION_BREAKPOINT) ? addrIndex(exAddr) : -1;
+
+            if (idx >= 0 && armed[idx]) {
+                HANDLE hThread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME,
+                                            FALSE, de.dwThreadId);
+                if (hThread) {
+                    CONTEXT ctx{};
+                    ctx.ContextFlags = CONTEXT_FULL;
+                    if (GetThreadContext(hThread, &ctx)) {
+                        BreakpointHit& hit = results[idx];
+                        hit.hitCount++;
+                        hit.rax = ctx.Rax; hit.rbx = ctx.Rbx; hit.rcx = ctx.Rcx; hit.rdx = ctx.Rdx;
+                        hit.rsi = ctx.Rsi; hit.rdi = ctx.Rdi; hit.rbp = ctx.Rbp; hit.rsp = ctx.Rsp;
+                        hit.r8  = ctx.R8;  hit.r9  = ctx.R9;  hit.r10 = ctx.R10; hit.r11 = ctx.R11;
+                        hit.r12 = ctx.R12; hit.r13 = ctx.R13; hit.r14 = ctx.R14; hit.r15 = ctx.R15;
+
+                        // Rewind past the INT3 and restore the original byte
+                        // permanently. One confirmed hit per slot is enough
+                        // for this diagnostic and avoids the single-step
+                        // re-arm dance needed for sustained hooking.
+                        ctx.Rip -= 1;
+                        SetThreadContext(hThread, &ctx);
+                        try {
+                            Memory::Write<uint8_t>(addresses[idx], originalBytes[idx]);
+                            armed[idx] = false;
+                        } catch (...) {}
+                    }
+                    CloseHandle(hThread);
+                }
+                continueStatus = DBG_CONTINUE;
+            } else {
+                // Not one of our breakpoints — pass through untouched so the
+                // target's own exception handling is never disturbed.
+                continueStatus = DBG_EXCEPTION_NOT_HANDLED;
+            }
+        }
+
+        ContinueDebugEvent(de.dwProcessId, de.dwThreadId, continueStatus);
+    }
+
+    for (size_t i = 0; i < addresses.size(); ++i) {
+        if (armed[i]) {
+            try { Memory::Write<uint8_t>(addresses[i], originalBytes[i]); } catch (...) {}
+        }
+    }
+    if (hProcess) FlushInstructionCache(hProcess, nullptr, 0);
+
+    DebugActiveProcessStop(pid);
+    LOG_INFO("[Privilege] CaptureBreakpointHits: detached from pid %lu (%s)",
+             pid, targetExited ? "target exited" : "duration elapsed");
+
+    return true;
+}
+
+// ============================================================
+//  Route H: Full read-only heap scan for a ScriptContext-classed object
+// ============================================================
+//
+// All six static pointer-chasing routes (A-F) converge on the same
+// FakeDataModel-derived decoy — the module's own offset dump literally
+// names that global "FakeDataModel", and its DataModel-classed target
+// has a permanently-null ScriptContext field and an empty/reversed
+// children list, live-verified across multiple runs. No offset chain
+// starting from that decoy can ever reach the real object.
+//
+// This route makes no assumption about which pointer chain is correct.
+// It walks every committed, private (heap), readable region of the
+// target's address space directly via VirtualQueryEx/ReadProcessMemory
+// and tests every plausible 8-byte-aligned pointer value for whether it
+// points to an object whose ClassDescriptor->ClassName resolves to
+// exactly "ScriptContext". Entirely read-only — no writes, no debugger
+// attach, no code patching.
+bool ScanForScriptContext(uintptr_t& outScriptContext, int timeBudgetMs) {
+    auto& engine = Engine::GetInstance();
+    if (!engine.IsAttached()) {
+        LOG_WARN("[Privilege] ScanForScriptContext: not attached");
+        return false;
+    }
+    HANDLE hProcess = engine.GetProcessHandle();
+
+    auto startTime = std::chrono::steady_clock::now();
+    auto elapsedMs = [&]() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - startTime).count();
+    };
+
+    uintptr_t addr = 0x10000;
+    const uintptr_t maxAddr = 0x7FFFFFFFFFFFULL;
+    size_t regionsScanned = 0, regionsSkipped = 0, candidatesChecked = 0, bytesScanned = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+
+    LOG_INFO("[Privilege] ScanForScriptContext: starting (budget=%dms)", timeBudgetMs);
+
+    while (addr < maxAddr) {
+        if (elapsedMs() > timeBudgetMs) {
+            LOG_WARN("[Privilege] ScanForScriptContext: time budget exceeded before 0x%llX "
+                     "(regions=%zu scanned/%zu skipped, candidates=%zu, bytes=%zu)",
+                     (unsigned long long)addr, regionsScanned, regionsSkipped, candidatesChecked, bytesScanned);
+            return false;
+        }
+
+        SIZE_T ret = VirtualQueryEx(hProcess, reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi));
+        if (ret == 0) break;
+
+        uintptr_t regionBase = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+        uintptr_t regionSize = static_cast<uintptr_t>(mbi.RegionSize);
+        if (regionSize == 0) break; // avoid infinite loop on malformed query
+        addr = regionBase + regionSize;
+
+        bool committed = (mbi.State == MEM_COMMIT);
+        bool isPrivate = (mbi.Type == MEM_PRIVATE);
+        bool readable  = committed &&
+            !(mbi.Protect & PAGE_NOACCESS) && !(mbi.Protect & PAGE_GUARD) &&
+            (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+
+        if (!committed || !isPrivate || !readable) {
+            ++regionsSkipped;
+            continue;
+        }
+        ++regionsScanned;
+
+        const size_t CHUNK = 4 * 1024 * 1024;
+        for (uintptr_t off = 0; off < regionSize; off += CHUNK) {
+            size_t thisChunk = static_cast<size_t>(
+                (regionSize - off < CHUNK) ? (regionSize - off) : CHUNK);
+            std::vector<uint8_t> buf(thisChunk);
+            SIZE_T bytesRead = 0;
+            if (!ReadProcessMemory(hProcess, reinterpret_cast<LPCVOID>(regionBase + off),
+                                    buf.data(), thisChunk, &bytesRead) || bytesRead == 0) {
+                continue;
+            }
+            bytesScanned += bytesRead;
+
+            size_t numWords = bytesRead / sizeof(uintptr_t);
+            const uintptr_t* words = reinterpret_cast<const uintptr_t*>(buf.data());
+            for (size_t i = 0; i < numWords; ++i) {
+                uintptr_t candidate = words[i];
+                if (!IsValidPointer(candidate) || (candidate % 8) != 0) continue;
+
+                ++candidatesChecked;
+                if ((candidatesChecked % 500000) == 0 && elapsedMs() > timeBudgetMs) {
+                    LOG_WARN("[Privilege] ScanForScriptContext: time budget exceeded mid-region "
+                             "(regions=%zu, candidates=%zu, bytes=%zu)",
+                             regionsScanned, candidatesChecked, bytesScanned);
+                    return false;
+                }
+
+                std::string cn;
+                try { cn = ReadClassName(candidate); } catch (...) { continue; }
+                if (cn == "ScriptContext") {
+                    LOG_INFO("[Privilege] ScanForScriptContext: FOUND @ 0x%llX "
+                             "(regions=%zu, candidates=%zu, bytes=%zu, elapsed=%lldms)",
+                             (unsigned long long)candidate, regionsScanned, candidatesChecked,
+                             bytesScanned, (long long)elapsedMs());
+                    outScriptContext = candidate;
+                    return true;
+                }
+            }
+        }
+
+        if ((regionsScanned % 200) == 0) {
+            LOG_INFO("[Privilege] ScanForScriptContext: progress — regions=%zu (%zu skipped), "
+                     "candidates=%zu, bytes=%zuMB, elapsed=%lldms",
+                     regionsScanned, regionsSkipped, candidatesChecked,
+                     bytesScanned / (1024 * 1024), (long long)elapsedMs());
+        }
+    }
+
+    LOG_WARN("[Privilege] ScanForScriptContext: exhausted address space without a match "
+             "(regions=%zu scanned/%zu skipped, candidates=%zu, bytes=%zuMB)",
+             regionsScanned, regionsSkipped, candidatesChecked, bytesScanned / (1024 * 1024));
+    return false;
 }
 
 // ============================================================
