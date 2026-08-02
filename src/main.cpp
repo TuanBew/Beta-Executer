@@ -34,6 +34,7 @@
 #include "Core/PrivilegeElevation.h"
 #include "Lua/LuaBridge.h"
 #include "GUI/GUI.h"
+#include "Protocol/PipeServer.h"
 
 static void PrintUsage() {
     printf("\n");
@@ -229,21 +230,26 @@ int main(int argc, char* argv[]) {
             if (ok) {
                 LOG_INFO("Successfully attached to '%s'", target.c_str());
                 attached = true;
+                // Start pipe server for payload communication
+                PipeServer::GetInstance().Initialize();
             } else {
                 LOG_ERROR("Failed to attach to '%s'. Try running as Administrator.", target.c_str());
             }
         }
     }
 
-    // ---- Determine mode: GUI (default), console (--console), or headless one-shot (--run) ----
+    // ---- Determine mode: GUI (default), console (--console), or headless one-shot (--run / --run-pipe) ----
     bool useConsole = false;
     std::string runScript;
+    std::string runPipeScript;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--console") {
             useConsole = true;
         } else if (a == "--run" && i + 1 < argc) {
             runScript = argv[++i];
+        } else if (a == "--run-pipe" && i + 1 < argc) {
+            runPipeScript = argv[++i];
         }
     }
 
@@ -258,6 +264,19 @@ int main(int argc, char* argv[]) {
             LOG_INFO("[Main] Headless run complete: %s", runScript.c_str());
         } else {
             LOG_ERROR("[Main] Headless run failed: %s", runScript.c_str());
+        }
+    } else if (!runPipeScript.empty()) {
+        // ---- Headless pipe one-shot: run script via pipe to payload DLL ----
+        if (!attached || !PipeServer::GetInstance().IsConnected()) {
+            LOG_ERROR("[Main] --run-pipe requires --attach with pipe-connected target");
+        } else {
+            LOG_INFO("[Main] Pipe run: executing '%s'", runPipeScript.c_str());
+            std::string errorMsg;
+            if (PipeServer::GetInstance().ExecuteScript(runPipeScript, errorMsg)) {
+                LOG_INFO("[Main] Pipe run complete: %s", runPipeScript.c_str());
+            } else {
+                LOG_ERROR("[Main] Pipe run failed: %s", errorMsg.c_str());
+            }
         }
     } else if (useConsole) {
         // ---- Legacy Console REPL ----
@@ -277,6 +296,7 @@ int main(int argc, char* argv[]) {
     LOG_INFO("[Main] Shutting down...");
 
     LuaBridge::GetInstance().Shutdown();
+    PipeServer::GetInstance().Shutdown();
     Engine::GetInstance().Detach();
     Privilege::Cleanup();
     Logging::CrashHandler::GetInstance().Uninstall();
