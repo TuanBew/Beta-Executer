@@ -73,6 +73,7 @@ static int l_print_bridge(lua_State* L);
 static int l_get_privilege_level(lua_State* L);
 static int l_set_privilege_level(lua_State* L);
 static int l_bypass_security_checks(lua_State* L);
+static int l_resolve_context(lua_State* L);
 
 // ---- Table of Bridge Functions to Register ----
 
@@ -119,12 +120,11 @@ static const luaL_Reg kBridgeFunctions[] = {
     {"get_privilege_level",    l_get_privilege_level},
     {"set_privilege_level",    l_set_privilege_level},
     {"bypass_security_checks", l_bypass_security_checks},
+    {"resolve_context",        l_resolve_context},
 
     {nullptr, nullptr}
 };
 
-// Sandbox instruction budget (per-thread, 1M instructions)
-static constexpr int kSandboxInstructionLimit = 1000000;
 
 // ---- Singleton Access ----
 
@@ -185,9 +185,9 @@ void LuaBridge::ApplySandbox() {
     // with a whitelisted subset of standard-library functions and enforces
     // per-thread instruction limits. Bridge functions registered afterward
     // (in RegisterBridgeFunctions) land in the sandboxed globals table.
-    luaL_sandbox(L, kSandboxInstructionLimit);
-    luaL_sandboxthread(L, kSandboxInstructionLimit);
-    LOG_DEBUG("[LuaBridge] Sandbox applied (instruction limit: %d)", kSandboxInstructionLimit);
+    luaL_sandbox(L);
+    luaL_sandboxthread(L);
+    LOG_DEBUG("[LuaBridge] Sandbox applied");
 }
 
 // ============================================================
@@ -196,7 +196,7 @@ void LuaBridge::ApplySandbox() {
 
 void LuaBridge::RegisterBridgeFunctions() {
     // Push our bridge functions into the global table
-    lua_pushglobaltable(L);
+    lua_pushvalue(L, LUA_GLOBALSINDEX);
 
     for (const luaL_Reg* reg = kBridgeFunctions; reg->name != nullptr; ++reg) {
         lua_pushcfunction(L, reg->func, reg->name);
@@ -1147,10 +1147,13 @@ static int l_json_encode(lua_State* L) {
                 case LUA_TBOOLEAN:
                     return lua_toboolean(L, idx) != 0;
                 case LUA_TNUMBER:
-                    if (lua_isinteger(L, idx)) {
-                        return lua_tointeger(L, idx);
+{
+                        double n = lua_tonumber(L, idx);
+                        int ni = static_cast<int>(n);
+                        if (static_cast<double>(ni) == n)
+                            return ni;
+                        return n;
                     }
-                    return lua_tonumber(L, idx);
                 case LUA_TSTRING:
                     return lua_tostring(L, idx);
                 case LUA_TTABLE: {
@@ -1295,6 +1298,57 @@ static int l_bypass_security_checks(lua_State* L) {
         return 1;
     } catch (const std::exception& e) {
         lua_pushboolean(L, false);
+        lua_pushstring(L, e.what());
+        return 2;
+    }
+}
+
+/**
+ * resolve_context() → table | nil, error
+ *
+ * Returns a table with the full chain resolution info:
+ *   { moduleBase, dataModel, scriptContext, currentLevel,
+ *     resolutionPath, requireBypass, attached }
+ */
+static int l_resolve_context(lua_State* L) {
+    try {
+        Privilege::ContextInfo ctx;
+        bool ok = Privilege::ResolveContext(ctx);
+
+        lua_newtable(L);
+
+        lua_pushboolean(L, ctx.attached);
+        lua_setfield(L, -2, "attached");
+
+        lua_pushinteger(L, static_cast<lua_Integer>(ctx.moduleBase));
+        lua_setfield(L, -2, "moduleBase");
+
+        lua_pushinteger(L, static_cast<lua_Integer>(ctx.dataModel));
+        lua_setfield(L, -2, "dataModel");
+
+        lua_pushinteger(L, static_cast<lua_Integer>(ctx.scriptContext));
+        lua_setfield(L, -2, "scriptContext");
+
+        lua_pushinteger(L, ctx.currentLevel);
+        lua_setfield(L, -2, "currentLevel");
+
+        lua_pushstring(L, ctx.resolutionPath.c_str());
+        lua_setfield(L, -2, "resolutionPath");
+
+        lua_pushboolean(L, ctx.requireBypass);
+        lua_setfield(L, -2, "requireBypass");
+
+        lua_pushboolean(L, ok);
+        lua_setfield(L, -2, "resolved");
+
+        if (!ok) {
+            lua_pushstring(L, ctx.lastError.c_str());
+            lua_setfield(L, -2, "error");
+        }
+
+        return 1;
+    } catch (const std::exception& e) {
+        lua_pushnil(L);
         lua_pushstring(L, e.what());
         return 2;
     }
