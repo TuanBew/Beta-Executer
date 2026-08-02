@@ -1,6 +1,7 @@
 #include "PayloadDLL.h"
 #include "PipeProtocol.h"
 #include "../Core/offsets.h"   // shared offset definitions
+#include <vector>
 #include <string>
 #include <cstdio>
 
@@ -57,7 +58,10 @@ BOOL InitPayload(HMODULE hModule) {
 void ShutdownPayload() {
     g_running = false;
 
-    // Wake the pipe thread if it's blocked on ReadFile
+    // Wake the pipe thread if it's blocked on ReadFile.
+    // Benign race: pipe thread may close g_hPipe between check and CancelIoEx.
+    // If already closed, the thread is exiting naturally and WaitForSingleObject
+    // returns quickly.
     if (g_hPipe != INVALID_HANDLE_VALUE) {
         CancelIoEx(g_hPipe, nullptr);
     }
