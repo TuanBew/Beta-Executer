@@ -47,6 +47,14 @@ target_link_libraries(UniversalHub PRIVATE
     comdlg32
 )
 
+target_sources(UniversalHub PRIVATE
+    Protocol/PipeServer.cpp
+)
+
+target_include_directories(UniversalHub PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Payload   # for PipeProtocol.h
+)
+
 # Copy scripts and config to build directory
 add_custom_command(TARGET UniversalHub POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -55,6 +63,9 @@ add_custom_command(TARGET UniversalHub POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
     ${CMAKE_SOURCE_DIR}/config
     $<TARGET_FILE_DIR:UniversalHub>/config
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:PayloadDLL>
+    $<TARGET_FILE_DIR:UniversalHub>/PayloadDLL.dll
 )
 
 # Windows-specific: require admin for process access
@@ -63,3 +74,40 @@ if(WIN32)
         WIN32_EXECUTABLE FALSE  # Console for now (useful for logging during Phase 1-2)
     )
 endif()
+
+# ---- PayloadDLL — Injected into target process (Phase 1) ----
+
+# Generate C array from ScriptManager.lua
+set(SCRIPT_MANAGER_SRC "${CMAKE_CURRENT_SOURCE_DIR}/Payload/ScriptManager.lua")
+set(SCRIPT_MANAGER_INC "${CMAKE_CURRENT_BINARY_DIR}/ScriptManager.lua.inc")
+
+add_custom_command(
+    OUTPUT ${SCRIPT_MANAGER_INC}
+    COMMAND powershell -NoProfile -Command
+        "[System.IO.File]::WriteAllBytes('${SCRIPT_MANAGER_INC}',
+         [System.Text.Encoding]::UTF8.GetBytes(
+         'R\"lua(' + [System.IO.File]::ReadAllText('${SCRIPT_MANAGER_SRC}') + ')lua\"'))"
+    DEPENDS ${SCRIPT_MANAGER_SRC}
+    COMMENT "Embedding ScriptManager.lua as C array"
+)
+
+add_library(PayloadDLL SHARED
+    Payload/PayloadDLL.cpp
+    ${SCRIPT_MANAGER_INC}
+)
+
+target_include_directories(PayloadDLL PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_BINARY_DIR}     # for ScriptManager.lua.inc
+)
+
+target_link_libraries(PayloadDLL PRIVATE
+    Luau.VM
+    Luau.Compiler
+    Luau.Config
+)
+
+# No CRT dependency — reduces DLL size, avoids CRT init in target
+set_target_properties(PayloadDLL PROPERTIES
+    WIN32_EXECUTABLE FALSE
+)
