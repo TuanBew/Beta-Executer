@@ -6,17 +6,40 @@
 #include <stdexcept>
 #include <windows.h>
 #include "Engine.h"
+#include "../Injector/CapcomDriver.h"
 
 /**
  * Memory I/O module — provides templated read/write access to the target
  * process's virtual memory space using the Win32 ReadProcessMemory and
  * WriteProcessMemory APIs.
  *
+ * When the Capcom driver is loaded, all Read/Write operations are routed
+ * through kernel-mode IOCTL (MmCopyVirtualMemory) to bypass user-mode hooks.
+ * When the driver is not loaded, falls back to RPM/WPM.
+ *
  * All operations go through the Engine singleton's process handle.
  * Addresses are absolute virtual addresses in the target process.
  */
 
 namespace Memory {
+
+    // ---- Capcom routing helpers ----
+
+    namespace detail {
+        inline bool UseCapcom() {
+            return CapcomDriver::GetInstance().IsLoaded();
+        }
+
+        template<typename T>
+        T CapcomRead(DWORD pid, uintptr_t address) {
+            return CapcomDriver::GetInstance().Read<T>(pid, address);
+        }
+
+        template<typename T>
+        void CapcomWrite(DWORD pid, uintptr_t address, T value) {
+            CapcomDriver::GetInstance().Write<T>(pid, address, value);
+        }
+    }
 
     // ---- Type codes for Lua bridge (used in Phase 2+) ----
 
@@ -51,13 +74,18 @@ namespace Memory {
         }
 
         T value{};
-        SIZE_T bytesRead = 0;
-        if (!ReadProcessMemory(engine.GetProcessHandle(),
-                               reinterpret_cast<LPCVOID>(address),
-                               &value, sizeof(T), &bytesRead) ||
-            bytesRead != sizeof(T)) {
-            throw std::runtime_error("Memory::Read: ReadProcessMemory failed at 0x" +
-                                     std::to_string(address));
+        if (detail::UseCapcom()) {
+            // Use kernel R/W — bypasses user-mode hooks
+            value = detail::CapcomRead<T>(engine.GetPid(), address);
+        } else {
+            SIZE_T bytesRead = 0;
+            if (!ReadProcessMemory(engine.GetProcessHandle(),
+                                   reinterpret_cast<LPCVOID>(address),
+                                   &value, sizeof(T), &bytesRead) ||
+                bytesRead != sizeof(T)) {
+                throw std::runtime_error("Memory::Read: ReadProcessMemory failed at 0x" +
+                                         std::to_string(address));
+            }
         }
         return value;
     }
@@ -80,13 +108,18 @@ namespace Memory {
             throw std::runtime_error("Memory::Write: Not attached to a process");
         }
 
-        SIZE_T bytesWritten = 0;
-        if (!WriteProcessMemory(engine.GetProcessHandle(),
-                                reinterpret_cast<LPVOID>(address),
-                                &value, sizeof(T), &bytesWritten) ||
-            bytesWritten != sizeof(T)) {
-            throw std::runtime_error("Memory::Write: WriteProcessMemory failed at 0x" +
-                                     std::to_string(address));
+        if (detail::UseCapcom()) {
+            // Use kernel R/W — bypasses user-mode hooks
+            detail::CapcomWrite<T>(engine.GetPid(), address, value);
+        } else {
+            SIZE_T bytesWritten = 0;
+            if (!WriteProcessMemory(engine.GetProcessHandle(),
+                                    reinterpret_cast<LPVOID>(address),
+                                    &value, sizeof(T), &bytesWritten) ||
+                bytesWritten != sizeof(T)) {
+                throw std::runtime_error("Memory::Write: WriteProcessMemory failed at 0x" +
+                                         std::to_string(address));
+            }
         }
     }
 
@@ -107,11 +140,22 @@ namespace Memory {
 
         std::vector<char> buffer(maxLen + 1, 0);
         SIZE_T bytesRead = 0;
-        if (!ReadProcessMemory(engine.GetProcessHandle(),
-                               reinterpret_cast<LPCVOID>(address),
-                               buffer.data(), maxLen, &bytesRead)) {
-            throw std::runtime_error("Memory::ReadString: ReadProcessMemory failed at 0x" +
-                                     std::to_string(address));
+
+        if (detail::UseCapcom()) {
+            // Use kernel R/W — bypasses user-mode hooks
+            if (!CapcomDriver::GetInstance().ReadMemory(engine.GetPid(), address,
+                                                        buffer.data(), maxLen)) {
+                throw std::runtime_error("Memory::ReadString: Capcom read failed at 0x" +
+                                         std::to_string(address));
+            }
+            bytesRead = maxLen;
+        } else {
+            if (!ReadProcessMemory(engine.GetProcessHandle(),
+                                   reinterpret_cast<LPCVOID>(address),
+                                   buffer.data(), maxLen, &bytesRead)) {
+                throw std::runtime_error("Memory::ReadString: ReadProcessMemory failed at 0x" +
+                                         std::to_string(address));
+            }
         }
 
         // Find null terminator
@@ -139,11 +183,22 @@ namespace Memory {
 
         std::vector<uint8_t> buffer(count, 0);
         SIZE_T bytesRead = 0;
-        if (!ReadProcessMemory(engine.GetProcessHandle(),
-                               reinterpret_cast<LPCVOID>(address),
-                               buffer.data(), count, &bytesRead)) {
-            throw std::runtime_error("Memory::ReadBytes: ReadProcessMemory failed at 0x" +
-                                     std::to_string(address));
+
+        if (detail::UseCapcom()) {
+            // Use kernel R/W — bypasses user-mode hooks
+            if (!CapcomDriver::GetInstance().ReadMemory(engine.GetPid(), address,
+                                                        buffer.data(), count)) {
+                throw std::runtime_error("Memory::ReadBytes: Capcom read failed at 0x" +
+                                         std::to_string(address));
+            }
+            bytesRead = count;
+        } else {
+            if (!ReadProcessMemory(engine.GetProcessHandle(),
+                                   reinterpret_cast<LPCVOID>(address),
+                                   buffer.data(), count, &bytesRead)) {
+                throw std::runtime_error("Memory::ReadBytes: ReadProcessMemory failed at 0x" +
+                                         std::to_string(address));
+            }
         }
         buffer.resize(bytesRead);
         return buffer;
