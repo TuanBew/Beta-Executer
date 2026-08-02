@@ -16,6 +16,7 @@
 
 #include <string>
 #include <windows.h>
+#include <dbghelp.h>
 
 namespace Logging {
 

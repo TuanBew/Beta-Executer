@@ -304,6 +304,12 @@ std::vector<LogEntry> Logger::GetEntries(size_t maxCount) const {
     return result;
 }
 
+void Logger::ClearEntries() {
+    for (auto& entry : m_ringBuffer)
+        entry.message.clear();
+    m_ringWriteIndex.store(0, std::memory_order_relaxed);
+}
+
 // ---- Emergency Log (Crash Handler Interface) ----
 
 void Logger::EmergencyLog(const char* message) {

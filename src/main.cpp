@@ -24,6 +24,7 @@
 
 #include <string>
 #include <cstdlib>
+#include <iostream>
 
 #include "Logging/Logger.h"
 #include "Logging/CrashHandler.h"
