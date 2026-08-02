@@ -691,11 +691,11 @@ static bool HijackHeartbeat() {
     t[pos++] = 0x48; t[pos++] = 0x83; t[pos++] = 0xEC; t[pos++] = 0x28;
 
     // call rel32 HeartbeatTrampolineCallback
-    // rel32 = target - (trampPage + pos + 4)
+    // rel32 = target - (trampPage + pos + 5)  [RIP = instr_addr + 5 for E8]
     t[pos] = 0xE8;
     int32_t callRel = static_cast<int32_t>(
         reinterpret_cast<uintptr_t>(&HeartbeatTrampolineCallback) -
-        (reinterpret_cast<uintptr_t>(t) + pos + 4));
+        (reinterpret_cast<uintptr_t>(t) + pos + 5));
     memcpy(&t[pos + 1], &callRel, 4);
     pos += 5;
 
@@ -707,10 +707,10 @@ static bool HijackHeartbeat() {
     pos += 5;
 
     // jmp rel32 to heartbeat + 5 (continue after the patched 5 bytes)
-    // rel32 = (heartbeat + 5) - (trampPage + pos + 4)
+    // rel32 = (heartbeat + 5) - (trampPage + pos + 5)  [RIP = instr_addr + 5 for E9]
     t[pos] = 0xE9;
     int32_t jmpBackRel = static_cast<int32_t>(
-        (hbFuncPtr + 5) - (reinterpret_cast<uintptr_t>(t) + pos + 4));
+        (hbFuncPtr + 5) - (reinterpret_cast<uintptr_t>(t) + pos + 5));
     memcpy(&t[pos + 1], &jmpBackRel, 4);
     pos += 5;
 
