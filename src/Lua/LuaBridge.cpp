@@ -17,6 +17,7 @@
 #include <fstream>
 #include <sstream>
 #include <cstring>
+#include <filesystem>
 #include <nlohmann/json.hpp>
 
 // LuaU / Luau headers
@@ -73,6 +74,11 @@ static int l_print_bridge(lua_State* L);
 static int l_get_privilege_level(lua_State* L);
 static int l_set_privilege_level(lua_State* L);
 static int l_bypass_security_checks(lua_State* L);
+static int l_resolve_context(lua_State* L);
+static int l_dump_memory(lua_State* L);
+static int l_enumerate_jobs(lua_State* L);
+static int l_run_diagnostics(lua_State* L);
+static int l_scan_for_scriptcontext(lua_State* L);
 
 // ---- Table of Bridge Functions to Register ----
 
@@ -119,12 +125,15 @@ static const luaL_Reg kBridgeFunctions[] = {
     {"get_privilege_level",    l_get_privilege_level},
     {"set_privilege_level",    l_set_privilege_level},
     {"bypass_security_checks", l_bypass_security_checks},
+    {"resolve_context",        l_resolve_context},
+    {"dump_memory",            l_dump_memory},
+    {"enumerate_jobs",         l_enumerate_jobs},
+    {"run_diagnostics",        l_run_diagnostics},
+    {"scan_for_scriptcontext", l_scan_for_scriptcontext},
 
     {nullptr, nullptr}
 };
 
-// Sandbox instruction budget (per-thread, 1M instructions)
-static constexpr int kSandboxInstructionLimit = 1000000;
 
 // ---- Singleton Access ----
 
@@ -185,9 +194,9 @@ void LuaBridge::ApplySandbox() {
     // with a whitelisted subset of standard-library functions and enforces
     // per-thread instruction limits. Bridge functions registered afterward
     // (in RegisterBridgeFunctions) land in the sandboxed globals table.
-    luaL_sandbox(L, kSandboxInstructionLimit);
-    luaL_sandboxthread(L, kSandboxInstructionLimit);
-    LOG_DEBUG("[LuaBridge] Sandbox applied (instruction limit: %d)", kSandboxInstructionLimit);
+    luaL_sandbox(L);
+    luaL_sandboxthread(L);
+    LOG_DEBUG("[LuaBridge] Sandbox applied");
 }
 
 // ============================================================
@@ -196,7 +205,7 @@ void LuaBridge::ApplySandbox() {
 
 void LuaBridge::RegisterBridgeFunctions() {
     // Push our bridge functions into the global table
-    lua_pushglobaltable(L);
+    lua_pushvalue(L, LUA_GLOBALSINDEX);
 
     for (const luaL_Reg* reg = kBridgeFunctions; reg->name != nullptr; ++reg) {
         lua_pushcfunction(L, reg->func, reg->name);
@@ -373,6 +382,52 @@ void LuaBridge::ReportError(const std::string& context) {
 
 // ---------------------------- Helpers ----------------------------
 
+static std::string BridgeReadMSVCString(uintptr_t stringAddr) {
+    try {
+        size_t capacity = Memory::Read<size_t>(stringAddr + 0x18);
+        size_t length   = Memory::Read<size_t>(stringAddr + 0x10);
+        if (length == 0 || length > 4096) return "";
+        if (capacity < 16) {
+            auto bytes = Memory::ReadBytes(stringAddr, (length < 15 ? length : 15) + 1);
+            if (bytes.empty()) return "";
+            bytes.push_back(0);
+            return std::string(reinterpret_cast<const char*>(bytes.data()),
+                               length < 15 ? length : 15);
+        }
+        uintptr_t ptr = Memory::Read<uintptr_t>(stringAddr);
+        if (ptr < 0x10000 || ptr >= 0x7FFFFFFFFFFF) return "";
+        return Memory::ReadString(ptr, length < 256 ? length : 256);
+    } catch (...) { return ""; }
+}
+
+static std::string BridgeReadClassName(uintptr_t objectAddr) {
+    try {
+        uintptr_t cd = Memory::Read<uintptr_t>(objectAddr + offsets::ClassDescriptor);
+        if (cd < 0x10000 || cd >= 0x7FFFFFFFFFFF) return "";
+        uintptr_t np = Memory::Read<uintptr_t>(cd + offsets::ClassDescriptorToClassName);
+        if (np < 0x10000 || np >= 0x7FFFFFFFFFFF) return "";
+        return Memory::ReadString(np, 64);
+    } catch (...) { return ""; }
+}
+
+/**
+ * Luau's lua_Integer is a 32-bit `int` (see VM/include/lua.h). Pushing a
+ * 64-bit process address through lua_pushinteger/luaL_checkinteger silently
+ * truncates it to the low 32 bits and, since real addresses have that bit
+ * set, sign-extends it back into a huge garbage 64-bit value on the way out
+ * (e.g. 0x23A89E60598 becomes 0xFFFFFFFF89E60598). lua_Number (double) is
+ * exact for integers up to 2^53, far beyond any real process address, so
+ * every pointer must cross the Lua boundary through these helpers instead
+ * of lua_pushinteger/luaL_checkinteger.
+ */
+static inline void PushAddress(lua_State* L, uintptr_t addr) {
+    lua_pushnumber(L, static_cast<lua_Number>(addr));
+}
+
+static inline uintptr_t CheckAddress(lua_State* L, int idx) {
+    return static_cast<uintptr_t>(luaL_checknumber(L, idx));
+}
+
 /**
  * Resolve a typed value from the Lua stack at the given index.
  * Used by read/write bridge functions.
@@ -415,7 +470,9 @@ static void PushTypedValue(lua_State* L, Memory::TypeCode tc, uintptr_t addr) {
             lua_pushnumber(L, Memory::Read<double>(addr));
             break;
         case Memory::TypeCode::Int64:
-            lua_pushinteger(L, static_cast<lua_Integer>(Memory::Read<int64_t>(addr)));
+            // i64 reads are frequently pointers (e.g. ScriptContext+0x2B0 activeScript);
+            // lua_Integer is 32-bit in Luau, so this must go through lua_Number.
+            lua_pushnumber(L, static_cast<lua_Number>(Memory::Read<int64_t>(addr)));
             break;
         case Memory::TypeCode::Uint8:
             lua_pushinteger(L, static_cast<int>(Memory::Read<uint8_t>(addr)));
@@ -453,12 +510,12 @@ static void WriteTypedValue(lua_State* L, Memory::TypeCode tc, uintptr_t addr) {
  * type: "i32", "f32", "f64", "i64", "u8", "bool", "i16", "u32"
  */
 static int l_read_memory(lua_State* L) {
-    lua_Integer address = luaL_checkinteger(L, 1);
+    uintptr_t address = CheckAddress(L, 1);
     const char* typeStr = luaL_optstring(L, 2, "f32");
 
     try {
         Memory::TypeCode tc = ResolveTypeCode(typeStr);
-        PushTypedValue(L, tc, static_cast<uintptr_t>(address));
+        PushTypedValue(L, tc, address);
         return 1;
     } catch (const std::exception& e) {
         lua_pushnil(L);
@@ -473,12 +530,11 @@ static int l_read_memory(lua_State* L) {
  * Write a typed value to the target process.
  */
 static int l_write_memory(lua_State* L) {
-    lua_Integer address = luaL_checkinteger(L, 1);
+    uintptr_t addr = CheckAddress(L, 1);
     const char* typeStr = luaL_optstring(L, 3, "f32");
 
     try {
         Memory::TypeCode tc = ResolveTypeCode(typeStr);
-        uintptr_t addr = static_cast<uintptr_t>(address);
 
         switch (tc) {
             case Memory::TypeCode::Int32:
@@ -491,7 +547,9 @@ static int l_write_memory(lua_State* L) {
                 Memory::Write<double>(addr, static_cast<double>(luaL_checknumber(L, 2)));
                 break;
             case Memory::TypeCode::Int64:
-                Memory::Write<int64_t>(addr, static_cast<int64_t>(luaL_checkinteger(L, 2)));
+                // Value may itself be a pointer being written — read it as a
+                // double via checknumber, not the 32-bit checkinteger path.
+                Memory::Write<int64_t>(addr, static_cast<int64_t>(luaL_checknumber(L, 2)));
                 break;
             case Memory::TypeCode::Uint8:
                 Memory::Write<uint8_t>(addr, static_cast<uint8_t>(luaL_checkinteger(L, 2)));
@@ -528,12 +586,11 @@ static int l_write_memory(lua_State* L) {
  * Read a null-terminated string from the target process.
  */
 static int l_read_string(lua_State* L) {
-    lua_Integer address = luaL_checkinteger(L, 1);
+    uintptr_t address = CheckAddress(L, 1);
     lua_Integer maxLen = luaL_optinteger(L, 2, 256);
 
     try {
-        std::string str = Memory::ReadString(static_cast<uintptr_t>(address),
-                                             static_cast<size_t>(maxLen));
+        std::string str = Memory::ReadString(address, static_cast<size_t>(maxLen));
         lua_pushstring(L, str.c_str());
         return 1;
     } catch (const std::exception& e) {
@@ -548,30 +605,31 @@ static int l_read_string(lua_State* L) {
 /**
  * get_object_children(parentAddress) → {child1, child2, ...}
  *
- * Walk the Children linked list starting at parent+0x70.
- * Each node's "next" pointer is at offset 0x8.
- * Returns a table of child base addresses.
+ * Children are stored as a pointer array: start at parent+0x70, end at parent+0x78.
+ * Each slot in [start, end) is an 8-byte pointer to a child Instance.
  */
 static int l_get_object_children(lua_State* L) {
-    lua_Integer parentAddr = luaL_checkinteger(L, 1);
-    uintptr_t addr = static_cast<uintptr_t>(parentAddr);
+    uintptr_t addr = CheckAddress(L, 1);
 
     try {
-        // Read Children pointer at parent + offsets::Children (0x70)
-        uintptr_t firstChild = Memory::Read<uintptr_t>(addr + offsets::Children);
+        uintptr_t childStart = Memory::Read<uintptr_t>(addr + offsets::Children);
+        uintptr_t childEnd   = Memory::Read<uintptr_t>(addr + offsets::Children + 0x8);
 
         lua_newtable(L);
+
+        if (childStart == 0 || childEnd == 0 || childEnd <= childStart)
+            return 1;
+
         int index = 1;
+        const size_t kMaxChildren = 1000;
+        size_t count = 0;
 
-        uintptr_t current = firstChild;
-        const int kMaxChildren = 1000; // Safety limit
-
-        for (int i = 0; i < kMaxChildren && current != 0; ++i) {
-            lua_pushinteger(L, static_cast<lua_Integer>(current));
+        for (uintptr_t cur = childStart; cur < childEnd && count < kMaxChildren;
+             cur += sizeof(uintptr_t), ++count) {
+            uintptr_t child = Memory::Read<uintptr_t>(cur);
+            if (child == 0) continue;
+            PushAddress(L, child);
             lua_rawseti(L, -2, index++);
-
-            // Next sibling at offset 0x8 (ChildrenEnd)
-            current = Memory::Read<uintptr_t>(current + offsets::ChildrenEnd);
         }
 
         return 1;
@@ -585,29 +643,38 @@ static int l_get_object_children(lua_State* L) {
 /**
  * find_first_child(parentAddress, name) → address | nil
  *
- * Search the Children list for the first child whose Name (0x98) matches.
+ * Search the Children array for the first child whose Name matches.
+ * Name is read as SSO-aware MSVC string at child + 0x98.
  */
 static int l_find_first_child(lua_State* L) {
-    lua_Integer parentAddr = luaL_checkinteger(L, 1);
+    uintptr_t addr = CheckAddress(L, 1);
     const char* searchName = luaL_checkstring(L, 2);
 
     try {
-        uintptr_t addr = static_cast<uintptr_t>(parentAddr);
-        uintptr_t firstChild = Memory::Read<uintptr_t>(addr + offsets::Children);
+        uintptr_t childStart = Memory::Read<uintptr_t>(addr + offsets::Children);
+        uintptr_t childEnd   = Memory::Read<uintptr_t>(addr + offsets::Children + 0x8);
 
-        uintptr_t current = firstChild;
-        const int kMaxSearch = 1000;
-
-        for (int i = 0; i < kMaxSearch && current != 0; ++i) {
-            std::string childName = Memory::ReadString(current + offsets::Name);
-            if (childName == searchName) {
-                lua_pushinteger(L, static_cast<lua_Integer>(current));
-                return 1;
-            }
-            current = Memory::Read<uintptr_t>(current + offsets::ChildrenEnd);
+        if (childStart == 0 || childEnd == 0 || childEnd <= childStart) {
+            lua_pushnil(L);
+            return 1;
         }
 
-        lua_pushnil(L);  // Not found
+        const size_t kMaxSearch = 1000;
+        size_t count = 0;
+
+        for (uintptr_t cur = childStart; cur < childEnd && count < kMaxSearch;
+             cur += sizeof(uintptr_t), ++count) {
+            uintptr_t child = Memory::Read<uintptr_t>(cur);
+            if (child == 0) continue;
+
+            std::string childName = BridgeReadMSVCString(child + offsets::Name);
+            if (childName == searchName) {
+                PushAddress(L, child);
+                return 1;
+            }
+        }
+
+        lua_pushnil(L);
         return 1;
     } catch (const std::exception& e) {
         lua_pushnil(L);
@@ -624,11 +691,9 @@ static int l_find_first_child(lua_State* L) {
  *   ClassDescriptor + ClassDescriptorToClassName (0x8) → class name string
  */
 static int l_get_class_name(lua_State* L) {
-    lua_Integer objectAddr = luaL_checkinteger(L, 1);
+    uintptr_t addr = CheckAddress(L, 1);
 
     try {
-        uintptr_t addr = static_cast<uintptr_t>(objectAddr);
-
         // Read ClassDescriptor pointer at object+0x18
         uintptr_t cd = Memory::Read<uintptr_t>(addr + offsets::ClassDescriptor);
         if (cd == 0) {
@@ -703,42 +768,39 @@ static int l_get_remote_events(lua_State* L) {
         // class name "RemoteEvent" or "RemoteFunction"
 
         if (workspace != 0) {
-            uintptr_t firstChild = Memory::Read<uintptr_t>(workspace + offsets::Children);
-            uintptr_t current = firstChild;
-            const int kMaxScan = 5000;
+            uintptr_t childStart = Memory::Read<uintptr_t>(workspace + offsets::Children);
+            uintptr_t childEnd   = Memory::Read<uintptr_t>(workspace + offsets::Children + 0x8);
 
-            for (int i = 0; i < kMaxScan && current != 0; ++i) {
-                try {
-                    uintptr_t cd = Memory::Read<uintptr_t>(current + offsets::ClassDescriptor);
-                    if (cd != 0) {
-                        uintptr_t cnPtr = Memory::Read<uintptr_t>(cd + offsets::ClassDescriptorToClassName);
-                        if (cnPtr != 0) {
-                            std::string cn = Memory::ReadString(cnPtr, 64);
-                            if (cn == "RemoteEvent" || cn == "RemoteFunction") {
-                                // Push a table with name, address, type
-                                lua_newtable(L);
+            if (childStart != 0 && childEnd > childStart) {
+                const size_t kMaxScan = 5000;
+                size_t scanned = 0;
 
-                                lua_pushstring(L, "name");
-                                std::string objName = Memory::ReadString(current + offsets::Name);
-                                lua_pushstring(L, objName.c_str());
-                                lua_rawset(L, -3);
+                for (uintptr_t cur = childStart; cur < childEnd && scanned < kMaxScan;
+                     cur += sizeof(uintptr_t), ++scanned) {
+                    try {
+                        uintptr_t child = Memory::Read<uintptr_t>(cur);
+                        if (child == 0) continue;
 
-                                lua_pushstring(L, "address");
-                                lua_pushinteger(L, static_cast<lua_Integer>(current));
-                                lua_rawset(L, -3);
+                        std::string cn = BridgeReadClassName(child);
+                        if (cn == "RemoteEvent" || cn == "RemoteFunction") {
+                            lua_newtable(L);
 
-                                lua_pushstring(L, "type");
-                                lua_pushstring(L, cn.c_str());
-                                lua_rawset(L, -3);
+                            lua_pushstring(L, "name");
+                            std::string objName = BridgeReadMSVCString(child + offsets::Name);
+                            lua_pushstring(L, objName.c_str());
+                            lua_rawset(L, -3);
 
-                                lua_rawseti(L, -2, index++);
-                            }
+                            lua_pushstring(L, "address");
+                            PushAddress(L, child);
+                            lua_rawset(L, -3);
+
+                            lua_pushstring(L, "type");
+                            lua_pushstring(L, cn.c_str());
+                            lua_rawset(L, -3);
+
+                            lua_rawseti(L, -2, index++);
                         }
-                    }
-                    current = Memory::Read<uintptr_t>(current + offsets::ChildrenEnd);
-                } catch (...) {
-                    // Skip objects that fail to read
-                    current = Memory::Read<uintptr_t>(current + offsets::ChildrenEnd);
+                    } catch (...) { continue; }
                 }
             }
         }
@@ -762,7 +824,7 @@ static int l_get_remote_events(lua_State* L) {
  * FOR EDUCATIONAL DEMONSTRATION ONLY
  */
 static int l_intercept_function(lua_State* L) {
-    lua_Integer targetAddr = luaL_checkinteger(L, 1);
+    uintptr_t targetAddr = CheckAddress(L, 1);
     luaL_checktype(L, 2, LUA_TFUNCTION);
 
     // Store the callback in the Lua registry and get a reference
@@ -770,11 +832,10 @@ static int l_intercept_function(lua_State* L) {
     int callbackRef = lua_ref(L, LUA_REGISTRYINDEX);
 
     auto& bridge = LuaBridge::GetInstance();
-    InterceptHandle* handle = bridge.CreateIntercept(
-        static_cast<uintptr_t>(targetAddr), callbackRef);
+    InterceptHandle* handle = bridge.CreateIntercept(targetAddr, callbackRef);
 
     if (handle) {
-        lua_pushinteger(L, static_cast<lua_Integer>(handle->targetAddress));
+        PushAddress(L, handle->targetAddress);
     } else {
         lua_pushnil(L);
     }
@@ -1051,6 +1112,14 @@ static int l_write_file(lua_State* L) {
     const char* filename = luaL_checkstring(L, 1);
     const char* content = luaL_checkstring(L, 2);
 
+    try {
+        std::filesystem::path p(filename);
+        if (p.has_parent_path() && !p.parent_path().empty())
+            std::filesystem::create_directories(p.parent_path());
+    } catch (const std::exception&) {
+        // fall through — the ofstream open below will report the real failure
+    }
+
     std::ofstream file(filename);
     if (!file.is_open()) {
         lua_pushboolean(L, false);
@@ -1147,10 +1216,13 @@ static int l_json_encode(lua_State* L) {
                 case LUA_TBOOLEAN:
                     return lua_toboolean(L, idx) != 0;
                 case LUA_TNUMBER:
-                    if (lua_isinteger(L, idx)) {
-                        return lua_tointeger(L, idx);
+{
+                        double n = lua_tonumber(L, idx);
+                        int ni = static_cast<int>(n);
+                        if (static_cast<double>(ni) == n)
+                            return ni;
+                        return n;
                     }
-                    return lua_tonumber(L, idx);
                 case LUA_TSTRING:
                     return lua_tostring(L, idx);
                 case LUA_TTABLE: {
@@ -1214,7 +1286,7 @@ static int l_get_module_base(lua_State* L) {
 
     uintptr_t base = Memory::GetModuleBaseAddress(moduleName);
     if (base != 0) {
-        lua_pushinteger(L, static_cast<lua_Integer>(base));
+        PushAddress(L, base);
     } else {
         lua_pushnil(L);
         lua_pushstring(L, "Module not found");
@@ -1298,4 +1370,163 @@ static int l_bypass_security_checks(lua_State* L) {
         lua_pushstring(L, e.what());
         return 2;
     }
+}
+
+/**
+ * resolve_context() → table | nil, error
+ *
+ * Returns a table with the full chain resolution info:
+ *   { moduleBase, dataModel, scriptContext, currentLevel,
+ *     resolutionPath, requireBypass, attached }
+ */
+static int l_resolve_context(lua_State* L) {
+    try {
+        Privilege::ContextInfo ctx;
+        bool ok = Privilege::ResolveContext(ctx);
+
+        lua_newtable(L);
+
+        lua_pushboolean(L, ctx.attached);
+        lua_setfield(L, -2, "attached");
+
+        PushAddress(L, ctx.moduleBase);
+        lua_setfield(L, -2, "moduleBase");
+
+        PushAddress(L, ctx.dataModel);
+        lua_setfield(L, -2, "dataModel");
+
+        PushAddress(L, ctx.scriptContext);
+        lua_setfield(L, -2, "scriptContext");
+
+        lua_pushinteger(L, ctx.currentLevel);
+        lua_setfield(L, -2, "currentLevel");
+
+        lua_pushstring(L, ctx.resolutionPath.c_str());
+        lua_setfield(L, -2, "resolutionPath");
+
+        lua_pushboolean(L, ctx.requireBypass);
+        lua_setfield(L, -2, "requireBypass");
+
+        lua_pushboolean(L, ok);
+        lua_setfield(L, -2, "resolved");
+
+        PushAddress(L, ctx.fakeDataModel);
+        lua_setfield(L, -2, "fakeDataModel");
+
+        lua_pushboolean(L, ctx.detourInstalled);
+        lua_setfield(L, -2, "detourInstalled");
+
+        lua_pushinteger(L, ctx.candidateCount);
+        lua_setfield(L, -2, "candidateCount");
+
+        lua_pushboolean(L, ctx.pathATried);
+        lua_setfield(L, -2, "pathATried");
+
+        lua_pushboolean(L, ctx.pathBTried);
+        lua_setfield(L, -2, "pathBTried");
+
+        lua_pushboolean(L, ctx.pathCTried);
+        lua_setfield(L, -2, "pathCTried");
+
+        if (!ok) {
+            lua_pushstring(L, ctx.lastError.c_str());
+            lua_setfield(L, -2, "error");
+        }
+
+        return 1;
+    } catch (const std::exception& e) {
+        lua_pushnil(L);
+        lua_pushstring(L, e.what());
+        return 2;
+    }
+}
+
+static int l_dump_memory(lua_State* L) {
+    uintptr_t addr = CheckAddress(L, 1);
+    int count = static_cast<int>(luaL_optinteger(L, 2, 64));
+    if (count < 1) count = 1;
+    if (count > 4096) count = 4096;
+
+    try {
+        std::string dump = Memory::HexDump(addr, static_cast<size_t>(count));
+        lua_pushstring(L, dump.c_str());
+        return 1;
+    } catch (const std::exception& e) {
+        lua_pushnil(L);
+        lua_pushstring(L, e.what());
+        return 2;
+    }
+}
+
+static int l_enumerate_jobs(lua_State* L) {
+    try {
+        auto& engine = Engine::GetInstance();
+        if (!engine.IsAttached()) {
+            lua_newtable(L);
+            return 1;
+        }
+
+        uintptr_t base = engine.GetModuleBase();
+        uintptr_t tsPtr = Memory::Read<uintptr_t>(base + offsets::TaskSchedulerPointer);
+        if (tsPtr == 0) { lua_newtable(L); return 1; }
+
+        uintptr_t jobStart = Memory::Read<uintptr_t>(tsPtr + offsets::JobStart);
+        uintptr_t jobEnd   = Memory::Read<uintptr_t>(tsPtr + offsets::JobEnd);
+
+        lua_newtable(L);
+        int idx = 1;
+        size_t maxJobs = 256;
+        size_t count = 0;
+
+        for (uintptr_t cur = jobStart; cur < jobEnd && count < maxJobs;
+             cur += sizeof(uintptr_t), ++count) {
+            uintptr_t jobPtr = Memory::Read<uintptr_t>(cur);
+            if (jobPtr == 0) continue;
+
+            lua_newtable(L);
+
+            PushAddress(L, jobPtr);
+            lua_setfield(L, -2, "address");
+
+            lua_pushstring(L, BridgeReadMSVCString(jobPtr + offsets::Job_Name).c_str());
+            lua_setfield(L, -2, "name");
+
+            lua_pushstring(L, BridgeReadClassName(jobPtr).c_str());
+            lua_setfield(L, -2, "className");
+
+            lua_rawseti(L, -2, idx++);
+        }
+
+        return 1;
+    } catch (const std::exception& e) {
+        lua_pushnil(L);
+        lua_pushstring(L, e.what());
+        return 2;
+    }
+}
+
+static int l_run_diagnostics(lua_State* L) {
+    Privilege::RunDiagnostics();
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/**
+ * scan_for_scriptcontext([timeoutMs]) -> address | nil, error
+ * Route H: read-only full heap scan for a ScriptContext-classed object,
+ * independent of any offset chain. Bounded by timeoutMs (default 60000).
+ */
+static int l_scan_for_scriptcontext(lua_State* L) {
+    int timeoutMs = 60000;
+    if (lua_gettop(L) >= 1 && !lua_isnil(L, 1)) {
+        timeoutMs = static_cast<int>(luaL_checknumber(L, 1));
+    }
+    uintptr_t found = 0;
+    if (Privilege::ScanForScriptContext(found, timeoutMs)) {
+        PushAddress(L, found);
+        return 1;
+    }
+    lua_pushnil(L);
+    lua_pushstring(L, "not found within time budget");
+    return 2;
 }

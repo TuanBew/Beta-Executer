@@ -129,6 +129,60 @@ namespace Memory {
         return std::string(buffer.data(), len);
     }
 
+    // ---- Bulk Read ----
+
+    inline std::vector<uint8_t> ReadBytes(uintptr_t address, size_t count) {
+        auto& engine = Engine::GetInstance();
+        if (!engine.IsAttached()) {
+            throw std::runtime_error("Memory::ReadBytes: Not attached to a process");
+        }
+
+        std::vector<uint8_t> buffer(count, 0);
+        SIZE_T bytesRead = 0;
+        if (!ReadProcessMemory(engine.GetProcessHandle(),
+                               reinterpret_cast<LPCVOID>(address),
+                               buffer.data(), count, &bytesRead)) {
+            throw std::runtime_error("Memory::ReadBytes: ReadProcessMemory failed at 0x" +
+                                     std::to_string(address));
+        }
+        buffer.resize(bytesRead);
+        return buffer;
+    }
+
+    inline std::string HexDump(uintptr_t address, size_t size) {
+        std::string result;
+        result.reserve(size * 5);
+
+        try {
+            auto bytes = ReadBytes(address, size);
+            char line[128];
+            for (size_t off = 0; off < bytes.size(); off += 16) {
+                size_t lineLen = (bytes.size() - off < 16) ? bytes.size() - off : 16;
+                int pos = sprintf(line, "%016llX  ", (unsigned long long)(address + off));
+
+                for (size_t i = 0; i < 16; ++i) {
+                    if (i == 8) line[pos++] = ' ';
+                    if (i < lineLen)
+                        pos += sprintf(line + pos, "%02X ", bytes[off + i]);
+                    else
+                        pos += sprintf(line + pos, "   ");
+                }
+
+                line[pos++] = ' ';
+                for (size_t i = 0; i < lineLen; ++i) {
+                    uint8_t c = bytes[off + i];
+                    line[pos++] = (c >= 0x20 && c < 0x7F) ? (char)c : '.';
+                }
+                line[pos++] = '\n';
+                line[pos] = '\0';
+                result += line;
+            }
+        } catch (const std::exception& e) {
+            result = "HexDump failed at 0x" + std::to_string(address) + ": " + e.what() + "\n";
+        }
+        return result;
+    }
+
     /**
      * Get the base address of a loaded module in the target process.
      * Walks the module list of the target to find the named module.

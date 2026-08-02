@@ -38,10 +38,12 @@
     },
     "privilege": {
         "auto_elevate_on_attach": true,
-        "target_level": 8,
+        "target_level": 10,
         "min_level": 7,
         "max_level": 10,
         "bypass_security_checks": true,
-        "use_detour": false
+        "use_detour": false,
+        "retry_count": 5,
+        "retry_delay_ms": 1000
     }
 }

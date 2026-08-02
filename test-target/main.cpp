@@ -18,6 +18,7 @@
 #include <cstring>
 #include <thread>
 #include <chrono>
+#define NOMINMAX
 #include <windows.h>
 
 // Forward-declare offsets we'll simulate (matching offsets.h)

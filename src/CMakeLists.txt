@@ -44,6 +44,7 @@ target_link_libraries(UniversalHub PRIVATE
     Luau.Compiler
     Luau.Config
     dbghelp
+    comdlg32
 )
 
 # Copy scripts and config to build directory

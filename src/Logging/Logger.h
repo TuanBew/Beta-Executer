@@ -109,6 +109,8 @@ public:
      */
     std::vector<LogEntry> GetEntries(size_t maxCount = 200) const;
 
+    void ClearEntries();
+
     /**
      * Direct-write for crash handler — bypasses locks and formatting.
      * Appends a raw line to the crash log file using only kernel32 APIs.
