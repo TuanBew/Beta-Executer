@@ -5,6 +5,7 @@
 #include <string>
 #include <cstdio>
 #include <TlHelp32.h>
+#include <cstring>
 
 // ---- Global State ----
 static HMODULE      g_hModule       = nullptr;
@@ -33,6 +34,7 @@ static LONG CALLBACK VehHandler(PEXCEPTION_POINTERS ex); // Task 3
 static bool ElevatePrivilege();     // Task 4
 static bool HijackHeartbeat();      // Task 4
 static void RestoreHeartbeat();     // Task 4
+extern "C" void HeartbeatTrampolineCallback(); // Task 4 trampoline
 
 // ---- DllMain ----
 BOOL WINAPI DllMain(HINSTANCE hModule, DWORD reason, LPVOID) {
@@ -67,6 +69,22 @@ BOOL InitPayload(HMODULE hModule) {
     // Trigger lua_State capture on the main thread.
     // This will fire on the next lua_pcall execution via hardware breakpoint.
     CaptureLuaState();
+
+    // Wait for lua_State capture (VEH fires asynchronously on the main thread).
+    // The target's Lua scheduler calls lua_pcall every frame, so the breakpoint
+    // should hit within a few seconds at most.
+    for (int i = 0; i < 200 && g_luaState == 0; i++) {
+        Sleep(50);  // 10 second timeout total
+    }
+
+    // Task 4: elevate privilege, then hijack the Heartbeat scheduler job.
+    // Elevation MUST happen before hijack — the injected Script Manager needs
+    // level 10 identity to execute privileged APIs.
+    if (g_luaState && ElevatePrivilege() && HijackHeartbeat()) {
+        // Heartbeat trampoline will fire on the next scheduler tick,
+        // injecting the Script Manager. The trampoline restores itself.
+        g_stateFlags |= PipeProtocol::STATE_READY;
+    }
 
     return TRUE;
 }
@@ -406,17 +424,331 @@ static bool CaptureLuaStateViaTrampoline() {
     return g_luaState != 0;
 }
 
-// ---- Task 4 stubs (to be filled by Task 4) ----
+// ---- Task 5 stub: Script Manager source (populated by Task 5) ----
+// These are temporary empty placeholders. Task 5 will replace them with
+// the embedded Lua bytecode for the Script Manager. The Heartbeat trampoline
+// callback references these symbols so the injection site is pre-wired.
+static const char  g_ScriptManagerSource[]   = "-- Task 5 placeholder\n";
+static const size_t g_ScriptManagerSourceLen  = 0;
+
+// ================================================================
+//  Task 4: Privilege Elevation & Heartbeat Hijack
+// ================================================================
+
+// ---- ElevatePrivilege: Local Route H heap scan + identity write ----
+//
+// Since we are inside the target process, all memory access is via direct
+// pointer dereference (no RPM/WPM). We walk every committed, private,
+// readable memory region and test each 8-byte-aligned value as a potential
+// Roblox object pointer by checking ClassDescriptor->ClassName == "ScriptContext".
+//
+// On success, writes identity level 10 to ScriptContext+0x2C0 and populates
+// g_scriptContext. This MUST complete before the Heartbeat hijack fires.
 static bool ElevatePrivilege() {
-    // Task 4: elevate Roblox script context privilege
-    return false;
+    // Step 1: Locate ScriptContext via Route H logic (local version).
+    // Walk memory regions directly, test each 8-byte aligned value as a
+    // potential object pointer — check ClassDescriptor->ClassName.
+
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+
+    uintptr_t start = reinterpret_cast<uintptr_t>(si.lpMinimumApplicationAddress);
+    uintptr_t end   = reinterpret_cast<uintptr_t>(si.lpMaximumApplicationAddress);
+
+    MEMORY_BASIC_INFORMATION mbi;
+    uintptr_t addr = start;
+
+    while (addr < end) {
+        if (!VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi))) {
+            addr += si.dwPageSize;
+            continue;
+        }
+
+        // Only scan committed, private, readable memory (heap regions).
+        // Exclude guard pages, no-access regions, and mapped images.
+        if (mbi.State != MEM_COMMIT ||
+            mbi.Type  != MEM_PRIVATE ||
+            (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+            addr = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+            continue;
+        }
+
+        // Scan the region for potential ScriptContext pointers.
+        // Every 8-byte aligned value is a candidate.
+        uintptr_t regionStart = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+        size_t regionSize = mbi.RegionSize;
+        size_t scanSize = regionSize - (regionSize % 8);
+
+        for (size_t off = 0; off < scanSize; off += 8) {
+            __try {
+                uintptr_t candidate = *reinterpret_cast<uintptr_t*>(regionStart + off);
+
+                // Quick bounds check — discard obviously invalid pointers
+                if (candidate < reinterpret_cast<uintptr_t>(si.lpMinimumApplicationAddress) ||
+                    candidate > reinterpret_cast<uintptr_t>(si.lpMaximumApplicationAddress)) {
+                    continue;
+                }
+                // Must be 8-byte aligned (Roblox objects are heap allocated)
+                if ((candidate & 0x7) != 0) continue;
+
+                // Check ClassDescriptor at candidate+0x18
+                uintptr_t classDesc = *reinterpret_cast<uintptr_t*>(candidate + offsets::ClassDescriptor);
+                if (!classDesc) continue;
+                if (classDesc < reinterpret_cast<uintptr_t>(si.lpMinimumApplicationAddress) ||
+                    classDesc > reinterpret_cast<uintptr_t>(si.lpMaximumApplicationAddress)) {
+                    continue;
+                }
+
+                // Check ClassName at ClassDescriptor+0x8
+                uintptr_t classNamePtr = *reinterpret_cast<uintptr_t*>(classDesc + offsets::ClassDescriptorToClassName);
+                if (!classNamePtr) continue;
+
+                // Read class name string and compare
+                const char* className = reinterpret_cast<const char*>(classNamePtr);
+                if (className && strcmp(className, "ScriptContext") == 0) {
+                    g_scriptContext = candidate;
+                    break;
+                }
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                continue;
+            }
+        }
+
+        if (g_scriptContext) break;
+        addr = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    }
+
+    if (!g_scriptContext) return false;
+
+    // Step 2: Write identity level 10 to ScriptContext+0x2C0.
+    // Use VirtualProtect to ensure writability, then restore.
+    int* pIdentityLevel = reinterpret_cast<int*>(g_scriptContext + offsets::ScriptContextIdentityLevel);
+    DWORD oldProtect;
+    VirtualProtect(pIdentityLevel, sizeof(int), PAGE_READWRITE, &oldProtect);
+    *pIdentityLevel = 10;
+    VirtualProtect(pIdentityLevel, sizeof(int), oldProtect, &oldProtect);
+
+    // Step 3: Verify the write took effect.
+    int verifyLevel = *reinterpret_cast<int*>(g_scriptContext + offsets::ScriptContextIdentityLevel);
+    return verifyLevel == 10;
 }
 
+// ---- HeartbeatTrampolineCallback (extern "C" — called from raw assembly) ----
+//
+// The trampoline (written in raw bytes by HijackHeartbeat) calls this C
+// function. It executes in the Heartbeat job's thread context, within the
+// target's Lua scheduler frame.
+//
+// ONE-SHOT contract: the FIRST thing this callback does is restore the
+// original Heartbeat function bytes. After that, no persistent C++ hooks
+// remain. The Script Manager (injected here) takes over from Lua.
+extern "C" void HeartbeatTrampolineCallback() {
+    if (!g_luaState) return;
+
+    // ONE-SHOT: Restore original Heartbeat bytes BEFORE any risk of crash.
+    // If we crash during Script Manager injection, the Heartbeat is already
+    // restored — the target continues normally on the next tick.
+    RestoreHeartbeat();
+
+    // ---- Script Manager Injection (stub — filled by Task 5/6) ----
+    //
+    // The Script Manager source (g_ScriptManagerSource) will be embedded as
+    // a static const char array in Task 5. Task 6 will wire the actual
+    // luau_compile + luau_load + lua_pcall sequence.
+    //
+    // For now, this is a call site that references the Task 5 symbols:
+    //   size_t bytecodeSize = 0;
+    //   char* bytecode = luau_compile(g_ScriptManagerSource,
+    //                                  g_ScriptManagerSourceLen,
+    //                                  nullptr, &bytecodeSize);
+    //   if (bytecode) {
+    //       int status = luau_load(g_luaState, "=ScriptManager",
+    //                              bytecode, bytecodeSize, 0);
+    //       free(bytecode);
+    //       if (status == 0) {
+    //           lua_pcall(g_luaState, 0, 0, 0);
+    //       }
+    //   }
+
+    // After the Script Manager is loaded, it takes over —
+    // it registers with the target's Heartbeat scheduler and
+    // polls the pipe on each tick. No further C++ involvement.
+    (void)g_ScriptManagerSource;    // suppress unused-variable warning
+    (void)g_ScriptManagerSourceLen;
+}
+
+// ---- HijackHeartbeat: locate Heartbeat job and install one-shot trampoline ----
+//
+// 1. Read TaskScheduler pointer from the absolute address.
+// 2. Walk the job array to find the job whose name contains "Heartbeat".
+// 3. Scan candidate offsets within the job struct for a function pointer
+//    (validated by checking that it points to executable memory).
+// 4. Allocate a trampoline page, build the x64 call stub:
+//      sub rsp, 0x28        ; shadow space
+//      call HeartbeatTrampolineCallback
+//      add rsp, 0x28
+//      <original 5 bytes>
+//      jmp <heartbeat + 5>
+// 5. Save original 5 bytes and write jmp <trampoline> at Heartbeat entry.
 static bool HijackHeartbeat() {
-    // Task 4: install heartbeat trampoline for script execution
-    return false;
+    if (!g_luaState) return false;
+
+    // Step 1: Locate TaskScheduler via absolute pointer.
+    uintptr_t tsAddr = *reinterpret_cast<uintptr_t*>(offsets::TaskSchedulerPointer);
+    if (!tsAddr) return false;
+
+    // Step 2: Walk job array to find the Heartbeat job.
+    uintptr_t jobStart = 0, jobEnd = 0;
+    __try {
+        jobStart = *reinterpret_cast<uintptr_t*>(tsAddr + offsets::JobStart);
+        jobEnd   = *reinterpret_cast<uintptr_t*>(tsAddr + offsets::JobEnd);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+
+    if (!jobStart || !jobEnd || jobEnd <= jobStart) return false;
+
+    uintptr_t heartbeatJob = 0;
+    size_t maxJobs = 256;
+    size_t count = 0;
+
+    for (uintptr_t cur = jobStart; cur < jobEnd && count < maxJobs;
+         cur += sizeof(uintptr_t), ++count) {
+        __try {
+            uintptr_t jobPtr = *reinterpret_cast<uintptr_t*>(cur);
+            if (!jobPtr) continue;
+
+            // Check job name at Job_Name offset
+            uintptr_t namePtr = *reinterpret_cast<uintptr_t*>(jobPtr + offsets::Job_Name);
+            if (!namePtr) continue;
+
+            const char* name = reinterpret_cast<const char*>(namePtr);
+            if (name && strstr(name, "Heartbeat")) {
+                heartbeatJob = jobPtr;
+                break;
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            continue;
+        }
+    }
+
+    if (!heartbeatJob) return false;
+
+    // Step 3: Scan the job struct for the callback function pointer.
+    // The exact offset varies by build; try a list of known candidates.
+    // Validate by checking that the pointer targets executable memory.
+    uintptr_t hbFuncPtr = 0;
+    const uintptr_t candidateOffsets[] = { 0x10, 0x28, 0x38, 0x48, 0x58 };
+
+    for (uintptr_t candidateOff : candidateOffsets) {
+        __try {
+            uintptr_t candidate = *reinterpret_cast<uintptr_t*>(heartbeatJob + candidateOff);
+            if (!candidate) continue;
+
+            // Validate: does this address fall in executable memory?
+            MEMORY_BASIC_INFORMATION mbi2;
+            if (VirtualQuery(reinterpret_cast<LPCVOID>(candidate), &mbi2, sizeof(mbi2))) {
+                if (mbi2.State == MEM_COMMIT &&
+                    (mbi2.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                     PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
+                    hbFuncPtr = candidate;
+                    break;
+                }
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            continue;
+        }
+    }
+
+    if (!hbFuncPtr) return false;
+    g_heartbeatOrigAddr = hbFuncPtr;
+
+    // Step 4: Save the original 5 bytes at the Heartbeat entry point.
+    __try {
+        memcpy(g_heartbeatOrigBytes, reinterpret_cast<void*>(hbFuncPtr), 5);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+
+    // Step 5: Allocate a trampoline page and build the call stub.
+    //
+    // Layout (total 23 bytes, well within one page):
+    //   Offset  Size  Instruction
+    //   0       4     sub rsp, 0x28          ; x64 shadow space
+    //   4       5     call rel32 HeartbeatTrampolineCallback
+    //   9       4     add rsp, 0x28
+    //   13      5     <original 5 bytes>     ; stolen from Heartbeat entry
+    //   18      5     jmp rel32 <heartbeat + 5>  ; continue original function
+    void* trampPage = VirtualAlloc(nullptr, 0x1000,
+                                    MEM_COMMIT | MEM_RESERVE,
+                                    PAGE_EXECUTE_READWRITE);
+    if (!trampPage) return false;
+
+    uint8_t* t = static_cast<uint8_t*>(trampPage);
+    size_t pos = 0;
+
+    // sub rsp, 0x28
+    t[pos++] = 0x48; t[pos++] = 0x83; t[pos++] = 0xEC; t[pos++] = 0x28;
+
+    // call rel32 HeartbeatTrampolineCallback
+    // rel32 = target - (trampPage + pos + 4)
+    t[pos] = 0xE8;
+    int32_t callRel = static_cast<int32_t>(
+        reinterpret_cast<uintptr_t>(&HeartbeatTrampolineCallback) -
+        (reinterpret_cast<uintptr_t>(t) + pos + 4));
+    memcpy(&t[pos + 1], &callRel, 4);
+    pos += 5;
+
+    // add rsp, 0x28
+    t[pos++] = 0x48; t[pos++] = 0x83; t[pos++] = 0xC4; t[pos++] = 0x28;
+
+    // Original 5 bytes from Heartbeat entry
+    memcpy(&t[pos], g_heartbeatOrigBytes, 5);
+    pos += 5;
+
+    // jmp rel32 to heartbeat + 5 (continue after the patched 5 bytes)
+    // rel32 = (heartbeat + 5) - (trampPage + pos + 4)
+    t[pos] = 0xE9;
+    int32_t jmpBackRel = static_cast<int32_t>(
+        (hbFuncPtr + 5) - (reinterpret_cast<uintptr_t>(t) + pos + 4));
+    memcpy(&t[pos + 1], &jmpBackRel, 4);
+    pos += 5;
+
+    // Step 6: Write jmp to trampoline at the Heartbeat entry point.
+    DWORD oldProtect;
+    VirtualProtect(reinterpret_cast<void*>(hbFuncPtr), 5,
+                   PAGE_EXECUTE_READWRITE, &oldProtect);
+
+    uint8_t jmpPatch[5];
+    jmpPatch[0] = 0xE9;  // jmp rel32
+    int32_t jmpRel = static_cast<int32_t>(
+        reinterpret_cast<uintptr_t>(trampPage) - (hbFuncPtr + 5));
+    memcpy(&jmpPatch[1], &jmpRel, 4);
+    memcpy(reinterpret_cast<void*>(hbFuncPtr), jmpPatch, 5);
+
+    VirtualProtect(reinterpret_cast<void*>(hbFuncPtr), 5, oldProtect, &oldProtect);
+
+    return true;
 }
 
+// ---- RestoreHeartbeat: restore original 5 bytes at Heartbeat entry ----
+//
+// Called by HeartbeatTrampolineCallback on its first (and only) invocation.
+// This is the ONE-SHOT mechanism: the trampoline fires once, restores the
+// original Heartbeat code, and then returns. Subsequent Heartbeat ticks
+// execute the original function with no C++ involvement.
 static void RestoreHeartbeat() {
-    // Task 4: restore original heartbeat bytes
+    if (!g_heartbeatOrigAddr) return;
+
+    DWORD oldProtect;
+    VirtualProtect(reinterpret_cast<void*>(g_heartbeatOrigAddr), 5,
+                   PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy(reinterpret_cast<void*>(g_heartbeatOrigAddr),
+           g_heartbeatOrigBytes, 5);
+    VirtualProtect(reinterpret_cast<void*>(g_heartbeatOrigAddr), 5,
+                   oldProtect, &oldProtect);
+
+    // Clear the saved state so RestoreHeartbeat is idempotent
+    g_heartbeatOrigAddr = 0;
+    memset(g_heartbeatOrigBytes, 0, sizeof(g_heartbeatOrigBytes));
 }
