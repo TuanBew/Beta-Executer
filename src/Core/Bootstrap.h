@@ -39,4 +39,23 @@ namespace Bootstrap {
      */
     bool ManualMapIntoProcess(uint32_t pid, const std::string& dllPath);
 
+    /**
+     * User-mode manual-map a DLL into the target process via
+     * VirtualAllocEx/WriteProcessMemory/ReadProcessMemory + thread hijacking.
+     * No kernel driver required — bypasses Roblox's CreateRemoteThread kill
+     * by hijacking an existing wait-state thread to call DllMain.
+     *
+     * @param pid       Target process ID.
+     * @param dllPath   Absolute path to the DLL file.
+     * @return true if mapped and DllMain called successfully.
+     */
+    bool UserModeMapIntoProcess(uint32_t pid, const std::string& dllPath);
+
+    /**
+     * Diagnostic: test whether CreateRemoteThread works against the attached
+     * target by calling Sleep(1) in the remote process. Returns true if the
+     * remote thread completed successfully.
+     */
+    bool TestRemoteThread();
+
 } // namespace Bootstrap

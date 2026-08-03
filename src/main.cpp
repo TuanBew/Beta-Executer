@@ -22,6 +22,7 @@
  * in a controlled offline environment.
  */
 
+#include <cstdio>
 #include <string>
 #include <cstdlib>
 #include <iostream>
@@ -191,6 +192,8 @@ static void RunConsoleRepl() {
             LOG_INFO("FOR EDUCATIONAL DEMONSTRATION ONLY");
             if (g_injectMode == "manual") {
                 Bootstrap::ManualMapIntoProcess(Engine::GetInstance().GetPid(), args);
+            } else if (g_injectMode == "usermap") {
+                Bootstrap::UserModeMapIntoProcess(Engine::GetInstance().GetPid(), args);
             } else {
                 Bootstrap::LoadIntoProcess(args);
             }
@@ -208,6 +211,9 @@ static void RunConsoleRepl() {
 // ---- Main ----
 
 int main(int argc, char* argv[]) {
+    fprintf(stderr, "[TRACE] main() entered, argc=%d\n", argc);
+    fflush(stderr);
+
     // ---- 1. Logger ----
     Logging::Logger::GetInstance().Initialize();
 
@@ -246,8 +252,6 @@ int main(int argc, char* argv[]) {
             if (ok) {
                 LOG_INFO("Successfully attached to '%s'", target.c_str());
                 attached = true;
-                // Start pipe server for payload communication
-                PipeServer::GetInstance().Initialize();
             } else {
                 LOG_ERROR("Failed to attach to '%s'. Try running as Administrator.", target.c_str());
             }
@@ -258,6 +262,8 @@ int main(int argc, char* argv[]) {
     bool useConsole = false;
     std::string runScript;
     std::string runPipeScript;
+    std::string bootstrapDll;
+    bool skipElevate = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--console") {
@@ -268,8 +274,71 @@ int main(int argc, char* argv[]) {
             runPipeScript = argv[++i];
         } else if (a == "--inject" && i + 1 < argc) {
             g_injectMode = argv[++i];  // "manual" or "legacy"
+        } else if (a == "--bootstrap" && i + 1 < argc) {
+            bootstrapDll = argv[++i];  // auto-inject DLL after attach
+        } else if (a == "--no-elevate") {
+            skipElevate = true;  // skip privilege elevation for faster testing
         }
     }
+
+    // ---- Auto-elevate (unless --no-elevate) ----
+    fprintf(stderr, "[DEBUG] attached=%d skipElevate=%d bootstrapDll='%s'\n",
+            attached, skipElevate, bootstrapDll.c_str());
+    if (attached && !skipElevate) {
+        fprintf(stderr, "[DEBUG] Calling AutoElevateOnAttach...\n");
+        Privilege::AutoElevateOnAttach();
+    } else if (attached) {
+        fprintf(stderr, "[DEBUG] Skipping elevation\n");
+    }
+
+    // ---- Auto-bootstrap: inject DLL after successful attach ----
+    fprintf(stderr, "[DEBUG] Auto-bootstrap check: attached=%d bootstrapDll.empty=%d injectMode='%s'\n",
+            attached, bootstrapDll.empty(), g_injectMode.c_str());
+    if (attached && !bootstrapDll.empty()) {
+        bool injected = false;
+
+        if (g_injectMode == "usermap") {
+            // User-mode manual map: skip TestRemoteThread (we already know
+            // CreateRemoteThread is blocked), go straight to thread hijack.
+            LOG_INFO("[Main] Auto-bootstrap (usermap): injecting '%s' into PID %lu",
+                     bootstrapDll.c_str(), Engine::GetInstance().GetPid());
+            injected = Bootstrap::UserModeMapIntoProcess(
+                Engine::GetInstance().GetPid(), bootstrapDll);
+        } else if (g_injectMode == "manual") {
+            // Kernel-assisted manual map (Capcom.sys required)
+            LOG_INFO("[Main] Auto-bootstrap (manual/kernel): injecting '%s' into PID %lu",
+                     bootstrapDll.c_str(), Engine::GetInstance().GetPid());
+            injected = Bootstrap::ManualMapIntoProcess(
+                Engine::GetInstance().GetPid(), bootstrapDll);
+        } else {
+            // Legacy: CreateRemoteThread + LoadLibraryA
+            fprintf(stderr, "[DEBUG] Running TestRemoteThread diagnostic first...\n");
+            fflush(stderr);
+            Bootstrap::TestRemoteThread();
+
+            LOG_INFO("[Main] Auto-bootstrap (legacy): injecting '%s' into PID %lu",
+                     bootstrapDll.c_str(), Engine::GetInstance().GetPid());
+            injected = Bootstrap::LoadIntoProcess(bootstrapDll);
+        }
+
+        if (injected) {
+            LOG_INFO("[Main] Bootstrap injection successful");
+            // Now start the pipe server — the DLL's client is already
+            // trying to connect. This blocks with a ~15s timeout.
+            PipeServer::GetInstance().Initialize();
+        } else {
+            LOG_ERROR("[Main] Bootstrap injection failed");
+        }
+    } else if (attached) {
+        // No bootstrap — start pipe server anyway (for manual use via REPL)
+        // But don't block headless mode — only if console or pipe-run is requested.
+    }
+
+    // If --bootstrap was given without an interactive mode flag, auto-exit.
+    bool headlessBootstrap = !bootstrapDll.empty() && !useConsole
+                             && runScript.empty() && runPipeScript.empty();
+    fprintf(stderr, "[DEBUG] headlessBootstrap=%d (bootstrapDll='%s' useConsole=%d runScript='%s' runPipeScript='%s')\n",
+            headlessBootstrap, bootstrapDll.c_str(), useConsole, runScript.c_str(), runPipeScript.c_str());
 
     if (!runScript.empty()) {
         // ---- Headless one-shot: attach (already done above), run script, exit ----
@@ -296,11 +365,22 @@ int main(int argc, char* argv[]) {
                 LOG_ERROR("[Main] Pipe run failed: %s", errorMsg.c_str());
             }
         }
+    } else if (headlessBootstrap) {
+        // ---- Headless bootstrap: inject, wait for pipe, exit ----
+        if (!attached) {
+            LOG_ERROR("[Main] --bootstrap requires a successful --attach");
+        } else if (PipeServer::GetInstance().IsConnected()) {
+            LOG_INFO("[Main] Bootstrap: PayloadDLL pipe connected — ready");
+        } else {
+            LOG_INFO("[Main] Bootstrap: DLL injected, pipe not yet connected (DLL may still be initializing)");
+        }
+        LOG_INFO("[Main] Bootstrap headless complete, exiting");
     } else if (useConsole) {
         // ---- Legacy Console REPL ----
         RunConsoleRepl();
     } else {
         // ---- GUI Mode (default) ----
+        fprintf(stderr, "[DEBUG] Entering GUI mode\n");
         if (GUI::GetInstance().Initialize("Universal Hub", 1280, 720)) {
             LOG_INFO("[Main] Entering GUI mode — press INSERT to toggle visibility");
             GUI::GetInstance().Run();

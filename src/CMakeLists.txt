@@ -22,6 +22,7 @@ add_library(Injector STATIC
     Injector/CapcomDriver.cpp
     Injector/KernelExec.cpp
     Injector/ManualMapInjector.cpp
+    Injector/UserModeMapper.cpp
 )
 
 target_include_directories(Injector PUBLIC
@@ -80,19 +81,17 @@ add_custom_command(TARGET UniversalHub POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
     $<TARGET_FILE:PayloadDLL>
     $<TARGET_FILE_DIR:UniversalHub>/PayloadDLL.dll
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:NullDLL>
+    $<TARGET_FILE_DIR:UniversalHub>/NullDLL.dll
 )
 
-# Bundle Capcom.sys into build output (only if driver is present — it is a
-# third-party BYOVD driver not tracked in this repository).
-if(EXISTS "${CMAKE_SOURCE_DIR}/scripts/Capcom.sys")
-    add_custom_command(TARGET UniversalHub POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        ${CMAKE_SOURCE_DIR}/scripts/Capcom.sys
-        $<TARGET_FILE_DIR:UniversalHub>/Capcom.sys
-    )
-else()
-    message(WARNING "Capcom.sys not found at scripts/Capcom.sys — kernel R/W will be unavailable. Place the driver file there and rebuild.")
-endif()
+# Capcom.sys (BYOVD kernel driver) is NOT bundled — the project's kernel R/W
+# path is optional. CapcomDriver.cpp falls back to user-mode RPM/WPM when the
+# driver is absent, and Bootstrap falls back to CreateRemoteThread+LoadLibraryA.
+# For educational demonstration in controlled offline environments, the user-mode
+# path is fully sufficient. To enable the kernel path, place Capcom.sys alongside
+# UniversalHub.exe and run as Administrator.
 
 # Windows-specific: require admin for process access
 if(WIN32)
@@ -128,7 +127,16 @@ target_link_libraries(PayloadDLL PRIVATE
     Luau.Config
 )
 
-# No CRT dependency — reduces DLL size, avoids CRT init in target
+# Static CRT is set globally in the root CMakeLists.txt — the DLL is
+# injected into a target process that does not have VC++ runtime DLLs.
 set_target_properties(PayloadDLL PROPERTIES
+    WIN32_EXECUTABLE FALSE
+)
+
+# NullDLL — minimal injection test payload (does nothing, confirms LoadLibraryA path)
+add_library(NullDLL SHARED
+    Payload/null_dll.cpp
+)
+set_target_properties(NullDLL PROPERTIES
     WIN32_EXECUTABLE FALSE
 )
