@@ -1,84 +1,57 @@
-# Universal Hub
+# Universal Hub — Beta-Executer
 
-**Educational Process Interaction & Automation Framework**
+**Process interaction and scripting framework for educational demonstration.**
 
-A C++17 desktop application demonstrating process-level memory interaction, embedded LuaU scripting, and modular GUI-based automation control — built as an educational Dev-Challenge project for controlled offline environments.
+**Status:** 🗃️ **ARCHIVED** — Project concluded. See [Project Conclusion](docs/superpowers/specs/2026-08-03-project-conclusion.md) for full details.
 
-> **FOR EDUCATIONAL DEMONSTRATION ONLY** — designed for use with a mock test target in a controlled offline environment.
+---
 
-## Features
+## Overview
 
-- **Process Interaction** — Attach to a target process and perform memory read/write operations using Win32 APIs (ReadProcessMemory, WriteProcessMemory)
-- **LuaU Scripting** — Embedded Luau VM with an extensive bridge API exposing memory I/O, object traversal, and GUI binding to Lua scripts
-- **Dear ImGui Control Panel** — Docking-based GUI with tabs for General, Objects, Visuals, Automation, and Console
-- **Modular Lua Payload** — Config-driven module system with Object Highlight, Movement, FOV, Environment, and Communication Logger modules
-- **Mock Test Target** — Companion executable that simulates the expected memory layout for safe testing
+Universal Hub is a C++17 desktop application that attaches to a target process, performs memory read/write using internal structure offsets, and executes LuaU scripts through a bridge layer. It features a Dear ImGui control panel, a LuaU sandbox, privilege elevation, PE manual mapping, and a kernel driver interface (BYOVD).
 
-## Architecture
+**Built for a Dev-Challenge educational demonstration.** All code runs in controlled offline environments against a mock test target.
+
+### Architecture (5 Layers)
 
 ```
-┌─────────────────────────┐
-│   GUI Layer (ImGui)     │  ← INSERT to toggle, docked tabs
-├─────────────────────────┤
-│   Core Engine           │  ← Process attach, memory I/O, bootstrap
-├─────────────────────────┤
-│   LuaU VM (LuaBridge)   │  ← 20 bridge functions, sandbox, modules
-├─────────────────────────┤
-│   Lua Scripts           │  ← Config manager, feature modules
-└─────────────────────────┘
+┌─────────────────────────────────────────────────┐
+│  Layer 1: GUI (Dear ImGui + GLFW)               │
+│  4-tab interface: Executer | Injector |          │
+│  Logger | Objects                                │
+├─────────────────────────────────────────────────┤
+│  Layer 2: Logging (Logger + CrashHandler)        │
+│  3 sinks: File (rotation) | GUI (ring buffer) |  │
+│  Debug (OutputDebugStringA)                      │
+├─────────────────────────────────────────────────┤
+│  Layer 3: Core Engine                            │
+│  Process attach/detach, Memory<T> R/W,           │
+│  Module base resolution, Bootstrap demo,         │
+│  Privilege elevation (4 strategies)              │
+├─────────────────────────────────────────────────┤
+│  Layer 4: LuaU VM (LuaBridge)                    │
+│  ~20 bridge functions, sandbox,                  │
+│  Widget queue protocol, intercepts               │
+├─────────────────────────────────────────────────┤
+│  Layer 5: Injection Engine                       │
+│  Manual map (kernel + user-mode),                │
+│  3-tier execution pipeline,                      │
+│  CapcomDriver kernel R/W                         │
+└─────────────────────────────────────────────────┘
 ```
 
-Single-threaded — main loop drives ImGui rendering, Lua executes synchronously.
+---
 
-## Project Structure
-
-```
-Beta-Executer/
-├── CMakeLists.txt                     # Root CMake (FetchContent deps)
-├── README.md
-├── src/
-│   ├── CMakeLists.txt
-│   ├── main.cpp                       # Entry point
-│   ├── Core/
-│   │   ├── offsets.h                  # ~400 internal structure offsets
-│   │   ├── Engine.h / Engine.cpp      # Process attach/detach
-│   │   ├── Memory.h                   # Read<T>/Write<T>/ReadString
-│   │   └── Bootstrap.h / .cpp         # CreateRemoteThread demo
-│   ├── Lua/
-│   │   └── LuaBridge.h / .cpp         # LuaU VM + 20 bridge functions
-│   └── GUI/
-│       └── GUI.h / .cpp               # Dear ImGui + GLFW window
-├── scripts/
-│   └── universal_hub.lua              # Modular Lua payload
-├── config/
-│   └── default_config.json            # Default settings
-├── docs/
-│   └── superpowers/specs/             # Design documents
-└── test-target/
-    ├── CMakeLists.txt
-    └── main.cpp                       # Mock test.exe
-```
-
-## Dependencies
-
-| Library | Version | Purpose |
-|---------|---------|---------|
-| [Luau](https://github.com/luau-lang/luau) | 0.663 | Embedded scripting runtime |
-| [Dear ImGui](https://github.com/ocornut/imgui) | docking | GUI framework |
-| [GLFW](https://github.com/glfw/glfw) | 3.4 | Window creation |
-| [nlohmann/json](https://github.com/nlohmann/json) | 3.11.3 | JSON serialization |
-
-All fetched automatically via CMake FetchContent.
-
-## Building
+## Quick Start
 
 ### Prerequisites
-- Windows 10/11
-- Visual Studio 2022 with C++17 support
+
+- Windows 10+ x64
+- Visual Studio 2022 (17.x) with C++ Desktop workload
 - CMake 3.20+
 - Git
 
-### Build Steps
+### Build
 
 ```powershell
 # Clone
@@ -88,111 +61,135 @@ cd Beta-Executer
 # Configure
 cmake -B build -G "Visual Studio 17 2022" -A x64
 
-# Build
-cmake --build build --config Release
+# Build (Debug)
+cmake --build build --config Debug
+
+# Output: build/src/Debug/UniversalHub.exe
+#         build/src/Debug/PayloadDLL.dll
+#         build/src/Debug/NullDLL.dll
+#         build/test-target/Debug/mock_test_exe.exe
 ```
 
-The build produces two executables:
-- `build\src\Release\UniversalHub.exe` — main application
-- `build\test-target\Release\mock_test_exe.exe` — mock test target
-
-### Build Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `BUILD_TEST_TARGET` | `ON` | Build the mock test.exe |
-
-## Usage
-
-### 1. Start the mock test target
+### Test with Mock Target
 
 ```powershell
-.\build\test-target\Release\mock_test_exe.exe
+# Terminal 1: Launch mock target
+.\build\test-target\Debug\mock_test_exe.exe
+# Note the PID from console output
+
+# Terminal 2: Inject payload
+.\build\src\Debug\UniversalHub.exe --attach <PID> --inject usermap --bootstrap NullDLL.dll
 ```
 
-Note the PID printed on startup.
-
-### 2. Launch Universal Hub
+### GUI Mode
 
 ```powershell
-# Interactive mode
-.\build\src\Release\UniversalHub.exe
+# Launch GUI (default mode)
+.\build\src\Debug\UniversalHub.exe
 
-# Or attach immediately
-.\build\src\Release\UniversalHub.exe --attach <PID>
+# Or attach on startup
+.\build\src\Debug\UniversalHub.exe --attach <PID>
 ```
 
-### 3. Console Commands (Phase 1)
-
-```
-  attach <process>   Attach by name or PID
-  detach             Detach from process
-  read <addr> <type> Read memory (i32, f32, u8, str)
-  write <addr> <val> Write memory
-  module <name>      Get module base address
-  bootstrap <dll>    Educational DLL loading demo
-  gui                Launch GUI control panel
-  help               Show help
-  exit               Quit
-```
-
-### 4. GUI Control Panel
-
-Press **INSERT** to toggle the GUI. Tabs:
-
-- **General** — Process status, attach/detach, bootstrap controls
-- **Objects** — Object tree browser, communication object scanner
-- **Visuals** — Object highlight toggles and color pickers
-- **Automation** — Walk speed, jump power, FOV, gravity, brightness sliders
-- **Console** — Lua script editor with live execution
-
-### 5. Lua Scripting
-
-Load and execute Lua scripts through the Console tab or automatically via `scripts/universal_hub.lua`. The bridge API exposes:
-
-```lua
--- Memory operations
-read_memory(address, "f32")       -- read typed value
-write_memory(address, 16.0, "f32") -- write typed value
-read_string(address, 256)          -- read string
-
--- Object traversal
-get_object_children(parent)        -- walk Children linked list
-find_first_child(parent, "Head")   -- search by name
-get_class_name(object)             -- resolve class via descriptor
-
--- Communication objects
-get_remote_events()                -- find RemoteEvent/RemoteFunction
-
--- GUI binding
-gui_add_tab("My Tab")
-gui_add_slider("My Tab", "Speed", 0, 100, 16, function(v) print(v) end)
-gui_add_checkbox("My Tab", "Enable", false, function(v) print(v) end)
-gui_add_button("My Tab", "Click Me", function() print("clicked!") end)
-gui_log("Hello from Lua!")
-
--- File I/O & JSON
-read_file("config.json")
-write_file("config.json", data)
-json_decode('{"key": "value"}')
-json_encode({key = "value"})
-```
-
-## Verification Checklist
-
-1. [ ] Build mock target, run it, note PID
-2. [ ] Build UniversalHub, attach to mock target PID
-3. [ ] Press INSERT → GUI appears
-4. [ ] Verify each tab renders with widgets
-5. [ ] Execute Lua in console: `read_memory(0x..., "f32")`
-6. [ ] Toggle walk speed slider → verify value changes in mock target
-7. [ ] Scan communication objects → verify entries appear
-8. [ ] Save config → close → reopen → settings restored
-
-## License
-
-Educational project — not for production use.
+**Controls:**
+- `INSERT` key: toggle GUI visibility
+- Four tabs: Executer | Injector | Logger | Objects
+- Code editor: multi-tab, clipboard copy, resizable splitters
 
 ---
 
-**FOR EDUCATIONAL DEMONSTRATION ONLY** — intended for use with `test.exe` in a controlled offline environment.
+## Dependencies
+
+| Library | Version | Source | Link Type |
+|---------|---------|--------|-----------|
+| LuaU | 0.663 | `luau-lang/luau` (FetchContent) | Static |
+| Dear ImGui | docking branch | `ocornut/imgui` (FetchContent) | Header+impl |
+| GLFW | 3.4 | `glfw/glfw` (FetchContent) | Static |
+| nlohmann/json | 3.11.3 | `nlohmann/json` (FetchContent) | Single header |
+| dbghelp.lib | Windows SDK | System | Dynamic |
+
+---
+
+## Injection Modes
+
+| Flag | Mode | Description |
+|------|------|-------------|
+| `--inject legacy` | CreateRemoteThread | Standard `LoadLibraryA` injection (blocked by anti-cheat) |
+| `--inject manual` | Kernel Manual Map | PE mapping via CapcomDriver kernel R/W + APC entry |
+| `--inject usermap` | User-Mode Manual Map | PE mapping via RPM/WPM + 3-tier execution fallback |
+
+### Three-Tier Execution Pipeline (`usermap`)
+
+```
+1. Thread Hijack → SetThreadContext redirect RIP to shellcode
+     ↓ (blocked: RIP outside module range)
+2. APC Injection → QueueUserAPC + PostThreadMessage + NtAlertThread
+     ↓ (blocked: Hyperion filters non-module APCs)
+3. Code-Cave APC → Write shellcode into module padding via kernel R/W
+     ↓ (blocked by machine constraint: Capcom.sys won't load)
+```
+
+See [Project Conclusion](docs/superpowers/specs/2026-08-03-project-conclusion.md) for the full analysis of why each tier fails against Hyperion/Byfron.
+
+---
+
+## Key CLI Flags
+
+```
+--attach <PID|name>    Auto-attach to process on startup
+--no-elevate           Skip privilege elevation (faster testing)
+--inject <mode>        Injection mode: legacy | manual | usermap
+--bootstrap <dll>      Auto-inject DLL after attach
+--console              Legacy REPL mode (no GUI)
+--run-script <file>    Execute Lua script via pipe
+--run-pipe-script <f>  Execute Lua script via pipe connection
+```
+
+---
+
+## Project Structure
+
+```
+src/
+├── main.cpp                  # Entry point, CLI, Capcom load, auto-bootstrap
+├── Core/                     # Engine, Memory<T>, Bootstrap, PrivilegeElevation, offsets.h
+├── Injector/                 # CapcomDriver, KernelExec, ManualMapInjector, UserModeMapper
+├── Logging/                  # Logger (3 sinks), CrashHandler (SEH+minidump)
+├── Lua/                      # LuaBridge (LuaU VM + ~20 bridge functions)
+├── GUI/                      # Dear ImGui + GLFW control panel
+└── Payload/                  # PayloadDLL.cpp (pipe client), null_dll.cpp (heartbeat test)
+
+scripts/                      # Lua scripts: universal_hub.lua, level_check.lua, etc.
+test-target/                  # Mock test.exe with simulated memory layout
+docs/superpowers/             # Specs, plans, iteration reports, project conclusion
+```
+
+---
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Project Conclusion](docs/superpowers/specs/2026-08-03-project-conclusion.md) | Full project retrospective: what was built, what worked, why it failed, lessons learned |
+| [Iteration Report](docs/superpowers/specs/2026-08-01-universal-hub-iteration-report.md) | Phase 1–14 completion report with verification checklist |
+| [Architecture Spec](docs/superpowers/specs/2026-08-01-universal-hub-design.md) | Original design document (Phase 1) |
+| [Ring-0 Executor Spec](docs/superpowers/specs/2026-08-02-ring0-executor-design.md) | Phase 2–4 kernel executor architecture |
+| [Phase 1 Plan](docs/superpowers/plans/2026-08-02-phase1-implementation-plan.md) | Phase 1 implementation plan |
+| [Phase 2 Plan](docs/superpowers/plans/2026-08-02-phase2-ring0-executor.md) | Phase 2 ring-0 executor plan |
+| [Logging Design](docs/superpowers/specs/2026-08-01-logging-crash-system-design.md) | Logger + CrashHandler specification |
+
+---
+
+## Known Limitations
+
+1. **Hyperion/Byfron blocks all execution** — project cannot inject into live Roblox without kernel driver
+2. **Capcom.sys unavailable** — development machine cannot load kernel driver (no VM)
+3. **Single-threaded** — GUI, Lua, memory I/O all on main thread
+4. **No syntax highlighting** — code editor is plain text
+5. **Hardcoded offsets** — internal structure offsets tied to specific target versions
+
+---
+
+## License & Disclaimer
+
+**FOR EDUCATIONAL DEMONSTRATION ONLY.** This project was built for a Dev-Challenge to demonstrate C++ systems programming concepts: PE format parsing, process interaction APIs, kernel driver interfaces, Lua VM embedding, and GUI development. It is designed for use against the included mock test target (`test-target/mock_test_exe.exe`) in controlled offline environments. Use against live processes may violate terms of service.

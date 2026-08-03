@@ -408,3 +408,22 @@ Per `prompt.txt` rules, the following terms are **never used** in code or docs:
 - ~~fire server~~ → "trigger communication object"
 
 All code comments include "FOR EDUCATIONAL DEMONSTRATION ONLY" disclaimers.
+
+---
+
+## 11. Phase 2 (Ring-0 Executor) — Final Status (added 2026-08-03)
+
+After Phase 1 completed (14 phases, commit `8503276`), Phase 2 aimed to build kernel-assisted injection to bypass Roblox's Hyperion anti-cheat. Status:
+
+| Phase 2 Component | Status | Commit |
+|-------------------|--------|--------|
+| `CapcomDriver` | ✅ Built | `096e0cb` — SCM load/unload, kernel R/W via DeviceIoControl |
+| `KernelExec` | ✅ Built | `f15791f` — HalDispatchTable hijack, ZwAllocateVirtualMemory |
+| `ManualMapInjector` | ✅ Built | `9e15512` — Full manual map via kernel R/W |
+| `UserModeMapper` | ✅ Built | `bbb433c` — Pure user-mode variant with 3-tier execution |
+| Three-tier pipeline | ✅ Built | `c9217ed` — Thread hijack → APC → Code-cave fallback |
+| Code-cave shellcode | ✅ Built | `c9217ed` — 78-byte APC shellcode, FindCodeCave() scanner |
+| Live Roblox injection | ❌ Blocked | Hyperion filters all user-mode execution primitives |
+| Capcom.sys loading | ❌ Blocked | Dev machine cannot load kernel driver (no VM) |
+
+**Conclusion:** Project archived at commit `c9217ed`. The PE mapper, shellcode builders, privilege chain, and Lua bridge are functional and reusable. The execution primitive is the unsolved problem — all three delivery mechanisms (thread hijack, APC, code-cave APC) are blocked by Hyperion's kernel-level hooks. See [Project Conclusion](2026-08-03-project-conclusion.md) for full analysis.

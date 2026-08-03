@@ -1,6 +1,10 @@
 # Phase 2: Ring-0 Kernel Driver Foundation & Manual Map Injector — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Status: PARTIALLY COMPLETE, PROJECT ARCHIVED.** See [Project Conclusion](../specs/2026-08-03-project-conclusion.md).
+> CapcomDriver, KernelExec, ManualMapInjector, and UserModeMapper are all built and functional
+> against the mock target. The three-tier execution pipeline is blocked by Hyperion anti-cheat
+> on live Roblox — the code-cave path (Tier 3) requires Capcom.sys which the dev machine
+> cannot load. All code is committed for reference.
 
 **Goal:** Build a kernel-assisted injection pipeline that loads the Phase 1 PayloadDLL into the target process via Capcom.sys BYOVD — replacing user-mode `CreateRemoteThread`+`LoadLibraryA` with a manual mapper operating entirely through kernel R/W IOCTLs, plus a kernel function execution primitive for remote memory allocation where standard APIs are hooked.
 

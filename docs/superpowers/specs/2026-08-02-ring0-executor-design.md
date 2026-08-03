@@ -1,7 +1,8 @@
 # Ring-0 Executor Architecture — Design Specification
 
-**Date:** 2026-08-02
-**Status:** Design approved, awaiting implementation plan
+**Date:** 2026-08-02 (updated 2026-08-03)
+**Status:** 🗃️ **ARCHIVED** — Phase 2 kernel R/W path blocked (Hyperion + no VM).
+See [Project Conclusion](2026-08-03-project-conclusion.md) for final analysis.
 **Scope:** Multi-layer script execution system with kernel privilege
 
 ---
