@@ -100,7 +100,7 @@ namespace Bootstrap {
 
 namespace Bootstrap {
 
-bool ManualMapIntoProcess(DWORD pid, const std::string& dllPath) {
+bool ManualMapIntoProcess(uint32_t pid, const std::string& dllPath) {
     return ManualMapInjector::GetInstance().Inject(pid, dllPath);
 }
 

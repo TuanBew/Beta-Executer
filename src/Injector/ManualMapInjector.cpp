@@ -118,7 +118,7 @@ bool ManualMapInjector::ParsePE(const std::vector<uint8_t>& dllBytes) {
     auto rvaToRaw = [&](uint32_t rva) -> const uint8_t* {
         for (const auto& sec : m_sections) {
             uint32_t secEnd = sec.VirtualAddress
-                            + std::max(sec.SizeOfRawData, sec.Misc.VirtualSize);
+                            + (std::max)(sec.SizeOfRawData, sec.Misc.VirtualSize);
             if (rva >= sec.VirtualAddress && rva < secEnd) {
                 // If rva falls past the raw data (e.g., .bss), there is
                 // nothing in the file — return nullptr.

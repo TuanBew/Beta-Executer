@@ -25,7 +25,7 @@ bool CapcomDriver::LoadDriver() {
         return false;
 
     LUID luid;
-    if (!LookupPrivilegeValueW(nullptr, SE_LOAD_DRIVER_NAME, &luid)) {
+    if (!LookupPrivilegeValueW(nullptr, L"SeLoadDriverPrivilege", &luid)) {
         CloseHandle(hToken);
         return false;
     }

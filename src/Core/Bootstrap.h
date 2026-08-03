@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <cstdint>
 
 /**
  * Bootstrap module — demonstrates loading a DLL into the target process's
@@ -36,6 +37,6 @@ namespace Bootstrap {
      * @param dllPath   Absolute path to the DLL file.
      * @return true if mapped and entry point executed successfully.
      */
-    bool ManualMapIntoProcess(DWORD pid, const std::string& dllPath);
+    bool ManualMapIntoProcess(uint32_t pid, const std::string& dllPath);
 
 } // namespace Bootstrap

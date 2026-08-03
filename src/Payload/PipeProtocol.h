@@ -20,7 +20,7 @@ enum class Command : uint16_t {
 
 enum class Result : uint8_t {
     OK    = 0,
-    ERROR = 1,
+    ERR   = 1,   // "ERROR" conflicts with Windows ERROR macro
     FATAL = 2,
 };
 

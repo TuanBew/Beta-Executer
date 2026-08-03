@@ -58,6 +58,7 @@ target_link_libraries(UniversalHub PRIVATE
     Luau.Config
     dbghelp
     comdlg32
+    ntdll
 )
 
 target_sources(UniversalHub PRIVATE
@@ -81,12 +82,17 @@ add_custom_command(TARGET UniversalHub POST_BUILD
     $<TARGET_FILE_DIR:UniversalHub>/PayloadDLL.dll
 )
 
-# Bundle Capcom.sys into build output
-add_custom_command(TARGET UniversalHub POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    ${CMAKE_SOURCE_DIR}/scripts/Capcom.sys
-    $<TARGET_FILE_DIR:UniversalHub>/Capcom.sys
-)
+# Bundle Capcom.sys into build output (only if driver is present — it is a
+# third-party BYOVD driver not tracked in this repository).
+if(EXISTS "${CMAKE_SOURCE_DIR}/scripts/Capcom.sys")
+    add_custom_command(TARGET UniversalHub POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CMAKE_SOURCE_DIR}/scripts/Capcom.sys
+        $<TARGET_FILE_DIR:UniversalHub>/Capcom.sys
+    )
+else()
+    message(WARNING "Capcom.sys not found at scripts/Capcom.sys — kernel R/W will be unavailable. Place the driver file there and rebuild.")
+endif()
 
 # Windows-specific: require admin for process access
 if(WIN32)
@@ -101,14 +107,10 @@ endif()
 set(SCRIPT_MANAGER_SRC "${CMAKE_CURRENT_SOURCE_DIR}/Payload/ScriptManager.lua")
 set(SCRIPT_MANAGER_INC "${CMAKE_CURRENT_BINARY_DIR}/ScriptManager.lua.inc")
 
-add_custom_command(
-    OUTPUT ${SCRIPT_MANAGER_INC}
-    COMMAND powershell -NoProfile -Command
-        "[System.IO.File]::WriteAllText('${SCRIPT_MANAGER_INC}',
-         'R"lua(' + [System.IO.File]::ReadAllText('${SCRIPT_MANAGER_SRC}') + ')lua"')"
-    DEPENDS ${SCRIPT_MANAGER_SRC}
-    COMMENT "Embedding ScriptManager.lua as C array"
-)
+# Embed ScriptManager.lua as a C++ raw string literal at configure time.
+# CMake file(READ)/file(WRITE) avoids PowerShell escaping issues.
+file(READ "${SCRIPT_MANAGER_SRC}" SCRIPT_MANAGER_CONTENT)
+file(WRITE "${SCRIPT_MANAGER_INC}" "R\"lua(${SCRIPT_MANAGER_CONTENT})lua\"\n")
 
 add_library(PayloadDLL SHARED
     Payload/PayloadDLL.cpp

