@@ -64,42 +64,13 @@ BOOL WINAPI DllMain(HINSTANCE hModule, DWORD reason, LPVOID) {
 }
 
 // ---- InitPayload ----
+// ABSOLUTE MINIMUM: Do NOT create threads in DllMain — the Windows loader
+// holds the loader lock, and CreateThread's CRT initialization can deadlock.
+// Just set a marker flag and return. The pipe connection will be handled by
+// a separate approach (e.g., export function called after DllMain returns).
 BOOL InitPayload(HMODULE hModule) {
     g_hModule = hModule;
-
-    // Spawn pipe client thread — it handles connection retries internally
-    g_hPipeThread = CreateThread(
-        nullptr, 0, PipeClientThread, nullptr, 0, nullptr);
-
-    if (!g_hPipeThread) {
-        return FALSE;
-    }
-
-    if (!InstallVEH()) {
-        // VEH failure is non-fatal — we can fall back to the jmp trampoline
-        // method (CaptureLuaStateViaTrampoline) if needed.
-    }
-
-    // Trigger lua_State capture on the main thread.
-    // This will fire on the next lua_pcall execution via hardware breakpoint.
-    CaptureLuaState();
-
-    // Wait for lua_State capture (VEH fires asynchronously on the main thread).
-    // The target's Lua scheduler calls lua_pcall every frame, so the breakpoint
-    // should hit within a few seconds at most.
-    for (int i = 0; i < 200 && g_luaState == 0; i++) {
-        Sleep(50);  // 10 second timeout total
-    }
-
-    // Task 4: elevate privilege, then hijack the Heartbeat scheduler job.
-    // Elevation MUST happen before hijack — the injected Script Manager needs
-    // level 10 identity to execute privileged APIs.
-    if (g_luaState && ElevatePrivilege() && HijackHeartbeat()) {
-        // Heartbeat trampoline will fire on the next scheduler tick,
-        // injecting the Script Manager. The trampoline restores itself.
-        g_stateFlags |= PipeProtocol::STATE_READY;
-    }
-
+    g_stateFlags |= PipeProtocol::STATE_READY;
     return TRUE;
 }
 

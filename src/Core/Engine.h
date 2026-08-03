@@ -74,6 +74,13 @@ private:
      */
     void ResolveModuleBase();
 
+public:
+    /**
+     * Skip auto-elevation on attach (set via --no-elevate CLI flag).
+     * Must be set before calling AttachToProcess().
+     */
+    static bool s_skipAutoElevate;
+
     HANDLE m_hProcess = nullptr;
     DWORD  m_Pid = 0;
     uintptr_t m_ModuleBase = 0;

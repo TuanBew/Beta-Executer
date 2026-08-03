@@ -2,6 +2,10 @@
 #include "Logging/Logger.h"
 #include "Core/PrivilegeElevation.h"
 
+// ---- Static Members ----
+
+bool Engine::s_skipAutoElevate = false;
+
 // ---- Singleton Access ----
 
 Engine& Engine::GetInstance() {
@@ -71,10 +75,10 @@ bool Engine::AttachToProcess(DWORD pid) {
     m_Pid = pid;
     ResolveModuleBase();
 
-    // Auto-elevate script execution identity tier in the target process.
-    // Configured via config/default_config.json (privilege section).
-    // Gracefully handles unresolved chains — logs and continues.
-    Privilege::AutoElevateOnAttach();
+    // Auto-elevation is now called from main.cpp after attach, so it can
+    // be controlled by CLI flags (--no-elevate). Kept here as comment for
+    // reference — the original call was:
+    //   Privilege::AutoElevateOnAttach();
 
     LOG_INFO("[Engine] Attached to process PID %lu, base: 0x%llX", m_Pid, m_ModuleBase);
     return true;

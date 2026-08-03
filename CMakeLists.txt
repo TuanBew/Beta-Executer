@@ -9,6 +9,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Static CRT for all targets — PayloadDLL is injected into a target process
+# that lacks the VC++ Debug CRT DLLs (MSVCP140D.dll, etc.). Static linking
+# (/MTd|/MT) bundles the CRT into every binary so injection works anywhere.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDebug")
+
 # ---- Dependencies via FetchContent ----
 
 include(FetchContent)

@@ -8,6 +8,7 @@
 //
 // FOR EDUCATIONAL DEMONSTRATION ONLY.
 #include "UserModeMapper.h"
+#include "CapcomDriver.h"
 
 #include <windows.h>
 #include <TlHelp32.h>
@@ -28,6 +29,7 @@ extern "C" NTSTATUS NTAPI NtQueryInformationThread(
     HANDLE ThreadHandle, ULONG ThreadInformationClass,
     PVOID ThreadInformation, ULONG ThreadInformationLength,
     PULONG ReturnLength);
+extern "C" NTSTATUS NTAPI NtAlertThread(HANDLE ThreadHandle);
 
 // ---- Singleton ------------------------------------------------------------
 
@@ -67,6 +69,25 @@ bool UserModeMapper::Inject(DWORD pid, const std::string& dllPath) {
         return false;
     }
     fprintf(stderr, "[UMM-DBG] OpenProcess OK: hProcess=0x%p\n", hProcess);
+
+    // 3a. Enable SeDebugPrivilege — needed when running as admin for
+    //     VirtualAllocEx/WriteProcessMemory into a user-level target process.
+    //     Without this, admin processes get ACCESS_DENIED (5) on cross-session calls.
+    {
+        HANDLE hToken;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+            LUID luidDebug;
+            if (LookupPrivilegeValueW(nullptr, L"SeDebugPrivilege", &luidDebug)) {
+                TOKEN_PRIVILEGES tp{};
+                tp.PrivilegeCount = 1;
+                tp.Privileges[0].Luid = luidDebug;
+                tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+                fprintf(stderr, "[UMM-DBG] SeDebugPrivilege enabled (err=%lu)\n", GetLastError());
+            }
+            CloseHandle(hToken);
+        }
+    }
 
     // 3. Parse PE
     if (!ParsePE(m_rawDll)) {
@@ -112,14 +133,23 @@ bool UserModeMapper::Inject(DWORD pid, const std::string& dllPath) {
     }
     fprintf(stderr, "[UMM-DBG] ResolveImports OK\n");
 
-    // 8. Hijack thread to execute DllMain
-    if (!ExecuteEntryPoint(hProcess, pid)) {
-        fprintf(stderr, "[UMM-DBG] ERROR: ExecuteEntryPoint failed\n");
+    // 8. Execute DllMain — try thread hijack first, then APC, then code-cave
+    bool entryOk = ExecuteEntryPoint(hProcess, pid);
+    if (!entryOk) {
+        fprintf(stderr, "[UMM-DBG] Thread hijack failed, trying APC injection...\n");
+        entryOk = TryApcExecute(hProcess, pid);
+    }
+    if (!entryOk) {
+        fprintf(stderr, "[UMM-DBG] APC injection failed, trying kernel code-cave injection...\n");
+        entryOk = TryKernelCodeCaveExecute(hProcess, pid);
+    }
+    if (!entryOk) {
+        fprintf(stderr, "[UMM-DBG] ERROR: all execution methods failed\n");
         VirtualFreeEx(hProcess, reinterpret_cast<LPVOID>(m_mappedBase), 0, MEM_RELEASE);
         CloseHandle(hProcess);
         return false;
     }
-    fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint OK — DllMain called\n");
+    fprintf(stderr, "[UMM-DBG] DllMain executed successfully\n");
 
     CloseHandle(hProcess);
     fprintf(stderr, "[UMM-DBG] Inject SUCCESS\n");
@@ -249,6 +279,7 @@ bool UserModeMapper::AllocateTargetMemory(HANDLE hProcess) {
     // Allocate enough for the PE image plus one extra page for shellcode/stack.
     const size_t allocSize = m_imageSize + 0x1000;
 
+    // Try VirtualAllocEx first (works in same-user, non-elevated context).
     m_mappedBase = reinterpret_cast<uintptr_t>(
         VirtualAllocEx(hProcess,
                        reinterpret_cast<LPVOID>(m_preferredBase),
@@ -256,12 +287,44 @@ bool UserModeMapper::AllocateTargetMemory(HANDLE hProcess) {
                        MEM_COMMIT | MEM_RESERVE,
                        PAGE_EXECUTE_READWRITE));
 
+    DWORD err1 = GetLastError();
+
     if (!m_mappedBase) {
-        // Retry with no base preference (let the kernel choose).
+        // Retry with no base preference.
         m_mappedBase = reinterpret_cast<uintptr_t>(
             VirtualAllocEx(hProcess, nullptr, allocSize,
                            MEM_COMMIT | MEM_RESERVE,
                            PAGE_EXECUTE_READWRITE));
+        DWORD err2 = GetLastError();
+
+        if (!m_mappedBase) {
+            // When running as admin, VirtualAllocEx may fail with ACCESS_DENIED
+            // on PPL or cross-session targets. Fall back to NtAllocateVirtualMemory
+            // which is a direct syscall (bypasses some win32u hooks).
+            using NtAllocFn = NTSTATUS(NTAPI*)(HANDLE, PVOID*, ULONG_PTR, PSIZE_T,
+                                                ULONG, ULONG);
+            static auto pNtAlloc = reinterpret_cast<NtAllocFn>(
+                GetProcAddress(GetModuleHandleW(L"ntdll.dll"),
+                               "NtAllocateVirtualMemory"));
+            if (pNtAlloc) {
+                SIZE_T regionSize = allocSize;
+                PVOID baseAddr = nullptr;
+                NTSTATUS st = pNtAlloc(hProcess, &baseAddr, 0, &regionSize,
+                                       MEM_COMMIT | MEM_RESERVE,
+                                       PAGE_EXECUTE_READWRITE);
+                m_mappedBase = reinterpret_cast<uintptr_t>(baseAddr);
+                fprintf(stderr, "[UMM-DBG] NtAllocateVirtualMemory fallback: "
+                        "status=0x%08lX base=0x%llX size=%zu\n",
+                        st, m_mappedBase, regionSize);
+            }
+
+            if (!m_mappedBase) {
+                fprintf(stderr, "[UMM-DBG] AllocateTargetMemory: all attempts failed "
+                        "(VirtualAllocEx preferred=0x%llX err=%lu, nullptr err=%lu, "
+                        "NtAlloc also failed)\n",
+                        m_preferredBase, err1, err2);
+            }
+        }
     }
 
     return m_mappedBase != 0;
@@ -619,17 +682,17 @@ uintptr_t UserModeMapper::ResolveForwardedExport(
 
 // ---- Thread Hijacking -----------------------------------------------------
 
-DWORD UserModeMapper::SelectTargetThread(DWORD pid, HANDLE hProcess) {
+HANDLE UserModeMapper::SelectTargetThread(DWORD pid, HANDLE hProcess) {
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (hSnap == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "[UMM-DBG] SelectTargetThread: snapshot failed (err=%lu)\n",
                 GetLastError());
-        return 0;
+        return NULL;
     }
 
     THREADENTRY32 te{sizeof(te)};
-    DWORD chosenTid = 0;
-    DWORD fallbackTid = 0;
+    HANDLE chosenHandle = NULL;
+    HANDLE fallbackHandle = NULL;
     bool firstFound = false;
 
     if (Thread32First(hSnap, &te)) {
@@ -637,21 +700,23 @@ DWORD UserModeMapper::SelectTargetThread(DWORD pid, HANDLE hProcess) {
             if (te.th32OwnerProcessID != pid)
                 continue;
 
-            // Skip the first thread (main/GUI thread) — hijacking it could
-            // cause visible stutter if DllMain takes any time at all.
+            // Skip the first thread (main/GUI thread)
             if (!firstFound) {
                 firstFound = true;
                 continue;
             }
 
+            // THREAD_ALERT (0x0004) is needed for NtAlertThread to succeed.
+            // Without it, NtAlertThread returns STATUS_ACCESS_DENIED (0xC0000022).
             HANDLE hThread = OpenThread(
                 THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
-                THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION,
+                THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION |
+                THREAD_SET_INFORMATION | 0x0004, // THREAD_ALERT
                 FALSE, te.th32ThreadID);
             if (!hThread)
                 continue;
 
-            // Check for pending I/O — hijacking a thread mid-I/O is risky.
+            // Check for pending I/O
             ULONG isIoPending = 0;
             NTSTATUS st = NtQueryInformationThread(
                 hThread, ThreadIsIoPending, &isIoPending,
@@ -661,58 +726,103 @@ DWORD UserModeMapper::SelectTargetThread(DWORD pid, HANDLE hProcess) {
                 continue;
             }
 
-            // Check if already suspended — must be able to resume it exactly once.
+            // Suspend the thread to freeze it for inspection
             DWORD prevCount = SuspendThread(hThread);
             if (prevCount == (DWORD)-1 || prevCount > 0) {
-                // prevCount > 0 means it was already suspended — skip.
                 if (prevCount != (DWORD)-1 && prevCount > 0)
-                    ResumeThread(hThread); // undo our SuspendThread
+                    ResumeThread(hThread);
                 CloseHandle(hThread);
                 continue;
             }
 
-            // Get context to inspect RIP
+            // Get context to inspect RIP while thread is frozen
             CONTEXT ctx{};
             ctx.ContextFlags = CONTEXT_CONTROL;
             bool gotContext = GetThreadContext(hThread, &ctx) != 0;
 
-            // Resume immediately — we'll re-suspend when we choose the winner.
-            ResumeThread(hThread);
-
             if (!gotContext) {
+                ResumeThread(hThread);
                 CloseHandle(hThread);
                 continue;
             }
 
-            // Check if RIP is in a safe wait function (preferred).
-            if (IsRipInSafeWait(ctx.Rip, hProcess)) {
-                chosenTid = te.th32ThreadID;
+            // Skip the thread we hijacked last time
+            if (te.th32ThreadID == m_lastHijackedTid) {
+                ResumeThread(hThread);
                 CloseHandle(hThread);
-                fprintf(stderr, "[UMM-DBG] SelectTargetThread: preferred TID=%lu (in safe wait)\n",
-                        chosenTid);
-                break;
+                continue;
             }
 
-            // Fallback: accept any thread outside the main module.
-            if (!fallbackTid) {
-                fallbackTid = te.th32ThreadID;
-                fprintf(stderr, "[UMM-DBG] SelectTargetThread: fallback TID=%lu (not in safe wait)\n",
-                        fallbackTid);
+            // Skip threads whose RIP falls within our own mapped region
+            uintptr_t mappedEnd = m_mappedBase + m_imageSize + 0x2000;
+            if (ctx.Rip >= m_mappedBase && ctx.Rip < mappedEnd) {
+                ResumeThread(hThread);
+                CloseHandle(hThread);
+                fprintf(stderr, "[UMM-DBG] SelectTargetThread: skipping TID=%lu (RIP=0x%llX in our mapped range)\n",
+                        te.th32ThreadID, ctx.Rip);
+                continue;
             }
 
-            CloseHandle(hThread);
+            // Skip threads whose RIP isn't in any known module (stale kernel-wait context)
+            if (!IsRipInKnownModule(ctx.Rip, pid)) {
+                ResumeThread(hThread);
+                CloseHandle(hThread);
+                fprintf(stderr, "[UMM-DBG] SelectTargetThread: skipping TID=%lu (RIP=0x%llX not in any known module)\n",
+                        te.th32ThreadID, ctx.Rip);
+                continue;
+            }
+
+            bool inSafeWait = IsRipInSafeWait(ctx.Rip, hProcess);
+            bool inSystemDll = IsRipInSystemDll(ctx.Rip, pid);
+
+            // Tier 1 (best): Thread executing application/user-mode DLL code.
+            // These are genuinely in user mode — SetThreadContext takes effect
+            // immediately on ResumeThread. Threads in ntdll/kernel32/kernelbase
+            // are almost always in or about to enter a syscall, where the kernel
+            // restores its own saved context, ignoring our RIP change.
+            if (!inSystemDll && !chosenHandle) {
+                chosenHandle = hThread; // KEEP SUSPENDED
+                fprintf(stderr, "[UMM-DBG] SelectTargetThread: preferred TID=%lu (app-code, RIP=0x%llX)\n",
+                        te.th32ThreadID, ctx.Rip);
+                break; // take the first app-code thread
+            }
+
+            // Tier 2 (fallback): Thread in a known ntdll wait function.
+            // We know it's in a kernel wait, but at least we know WHAT wait.
+            // May execute shellcode if the wait is alertable.
+            if (!chosenHandle && inSafeWait && !fallbackHandle) {
+                fallbackHandle = hThread; // KEEP SUSPENDED
+                fprintf(stderr, "[UMM-DBG] SelectTargetThread: fallback TID=%lu (wait-state, RIP=0x%llX)\n",
+                        te.th32ThreadID, ctx.Rip);
+                // Don't break — keep looking for an app-code thread
+            } else if (!chosenHandle && inSystemDll && !inSafeWait && !fallbackHandle) {
+                // Tier 3 (last resort): Thread in system DLL at unknown offset.
+                // Likely in a syscall — very unlikely to be hijackable.
+                fallbackHandle = hThread; // KEEP SUSPENDED
+                fprintf(stderr, "[UMM-DBG] SelectTargetThread: last-resort TID=%lu (sys-dll-nonwait, RIP=0x%llX)\n",
+                        te.th32ThreadID, ctx.Rip);
+            } else {
+                ResumeThread(hThread);
+                CloseHandle(hThread);
+            }
         } while (Thread32Next(hSnap, &te));
     }
 
     CloseHandle(hSnap);
 
-    if (chosenTid)
-        return chosenTid;
-    if (fallbackTid)
-        return fallbackTid;
+    // Return the best option found (prefer active, fall back to wait-state)
+    if (chosenHandle) {
+        if (fallbackHandle) {
+            ResumeThread(fallbackHandle);
+            CloseHandle(fallbackHandle);
+        }
+        return chosenHandle;
+    }
+    if (fallbackHandle)
+        return fallbackHandle;
 
     fprintf(stderr, "[UMM-DBG] SelectTargetThread: NO suitable thread found\n");
-    return 0;
+    return NULL;
 }
 
 bool UserModeMapper::IsRipInSafeWait(uintptr_t rip, HANDLE hProcess) {
@@ -756,6 +866,104 @@ bool UserModeMapper::IsRipInSafeWait(uintptr_t rip, HANDLE hProcess) {
     return false;
 }
 
+bool UserModeMapper::IsRipInSystemDll(uintptr_t rip, DWORD pid) {
+    // Check whether RIP falls within ntdll.dll, kernel32.dll, or kernelbase.dll.
+    // Threads executing in these DLLs are almost always in or about to enter
+    // a syscall — SetThreadContext won't take effect because the kernel saves
+    // its own copy of the user context before entering kernel mode.
+    //
+    // We cache the module ranges on first call (they're static per boot session).
+    static uintptr_t s_ntdllBase = 0, s_ntdllEnd = 0;
+    static uintptr_t s_kernel32Base = 0, s_kernel32End = 0;
+    static uintptr_t s_kernelbaseBase = 0, s_kernelbaseEnd = 0;
+    static bool s_resolved = false;
+
+    if (!s_resolved) {
+        s_resolved = true;
+
+        // Use CreateToolhelp32Snapshot on the TARGET to get accurate ranges.
+        // (Within a session, system DLLs load at the same base in all processes,
+        // but querying the target is more robust.)
+        HANDLE hModSnap = CreateToolhelp32Snapshot(
+            TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+        if (hModSnap != INVALID_HANDLE_VALUE) {
+            MODULEENTRY32 me{sizeof(me)};
+            if (Module32First(hModSnap, &me)) {
+                do {
+                    uintptr_t base = reinterpret_cast<uintptr_t>(me.modBaseAddr);
+                    uintptr_t end  = base + me.modBaseSize;
+                    if (_stricmp(me.szModule, "ntdll.dll") == 0) {
+                        s_ntdllBase = base; s_ntdllEnd = end;
+                    } else if (_stricmp(me.szModule, "kernel32.dll") == 0) {
+                        s_kernel32Base = base; s_kernel32End = end;
+                    } else if (_stricmp(me.szModule, "kernelbase.dll") == 0) {
+                        s_kernelbaseBase = base; s_kernelbaseEnd = end;
+                    }
+                } while (Module32Next(hModSnap, &me));
+            }
+            CloseHandle(hModSnap);
+        }
+
+        // Fallback: use our own process's module handles (same session = same base)
+        if (!s_ntdllBase) {
+            HMODULE h = GetModuleHandleA("ntdll.dll");
+            if (h) {
+                s_ntdllBase = reinterpret_cast<uintptr_t>(h);
+                // Size: parse PE headers for exact size... approximate is fine
+                // for the range check; ntdll is ~2MB.
+                s_ntdllEnd = s_ntdllBase + 0x200000;
+            }
+        }
+        if (!s_kernel32Base) {
+            HMODULE h = GetModuleHandleA("kernel32.dll");
+            if (h) {
+                s_kernel32Base = reinterpret_cast<uintptr_t>(h);
+                s_kernel32End = s_kernel32Base + 0x100000;
+            }
+        }
+        if (!s_kernelbaseBase) {
+            HMODULE h = GetModuleHandleA("kernelbase.dll");
+            if (h) {
+                s_kernelbaseBase = reinterpret_cast<uintptr_t>(h);
+                s_kernelbaseEnd = s_kernelbaseBase + 0x400000;
+            }
+        }
+    }
+
+    if ((s_ntdllBase && rip >= s_ntdllBase && rip < s_ntdllEnd) ||
+        (s_kernel32Base && rip >= s_kernel32Base && rip < s_kernel32End) ||
+        (s_kernelbaseBase && rip >= s_kernelbaseBase && rip < s_kernelbaseEnd)) {
+        return true;
+    }
+    return false;
+}
+
+bool UserModeMapper::IsRipInKnownModule(uintptr_t rip, DWORD pid) {
+    // Enumerate the target's loaded modules. If RIP falls within any
+    // module's address range, the thread is executing real code.
+    // If not, the thread is likely stuck in a kernel wait and
+    // GetThreadContext is returning a stale context (e.g., our own
+    // previously-set shellcode RIP).
+    HANDLE hModSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (hModSnap == INVALID_HANDLE_VALUE)
+        return false; // can't verify → assume unsafe, skip
+
+    MODULEENTRY32 me{sizeof(me)};
+    if (Module32First(hModSnap, &me)) {
+        do {
+            uintptr_t modBase = reinterpret_cast<uintptr_t>(me.modBaseAddr);
+            uintptr_t modEnd  = modBase + me.modBaseSize;
+            if (rip >= modBase && rip < modEnd) {
+                CloseHandle(hModSnap);
+                return true;
+            }
+        } while (Module32Next(hModSnap, &me));
+    }
+
+    CloseHandle(hModSnap);
+    return false;
+}
+
 std::vector<uint8_t> UserModeMapper::BuildHijackShellcode(
     uintptr_t mappedBase, uintptr_t entryAddr,
     uintptr_t originalRip, uintptr_t originalRsp) {
@@ -773,6 +981,7 @@ std::vector<uint8_t> UserModeMapper::BuildHijackShellcode(
     //   +0x20: savedRsp      (shellcode stores original RSP here at runtime)
     //   +0x28: stackTop      (top of our stack page)
     //   +0x30: done marker   (shellcode writes 1 here before jmp back)
+    //   +0x38: heartbeat     (shellcode writes 1 here BEFORE calling DllMain)
 
     constexpr uint32_t DATA_OFFSET = 0x300;  // data region within the shellcode page
     constexpr uint32_t STACK_TOP  = 0x1000; // stack grows down from page top
@@ -807,7 +1016,8 @@ std::vector<uint8_t> UserModeMapper::BuildHijackShellcode(
     uint8_t code[] = {
         // ── 1. Data base pointer ──
         // lea r11, [rip + data] — RIP-relative, patched with leaDisp
-        0x48, 0x8D, 0x1D,
+        //    REX.WR (4C) needed: R=1 so ModRM.reg=011 → r11 (not rbx)
+        0x4C, 0x8D, 0x1D,
         static_cast<uint8_t>(leaDisp & 0xFF),
         static_cast<uint8_t>((leaDisp >> 8) & 0xFF),
         static_cast<uint8_t>((leaDisp >> 16) & 0xFF),
@@ -842,6 +1052,11 @@ std::vector<uint8_t> UserModeMapper::BuildHijackShellcode(
         0x41, 0x53,
         // pushfq
         0x9C,
+
+        // ── 5.5. Heartbeat: write 1 BEFORE calling DllMain ──
+        // If this is set but done marker is not → DllMain crashed.
+        // mov qword [r11 + 0x38], 1
+        0x49, 0xC7, 0x43, 0x38, 0x01, 0x00, 0x00, 0x00,
 
         // ── 6. Call DllMain(hModule, DLL_PROCESS_ATTACH, NULL) ──
         // mov rcx, [r11 + 0x00]  — hModule
@@ -913,6 +1128,7 @@ std::vector<uint8_t> UserModeMapper::BuildHijackShellcode(
     // 0x20: savedRsp  — written by shellcode at runtime, leave 0
     patchData(0x28, stackBase);    // stack top
     // 0x30: done      — written by shellcode at runtime, leave 0
+    // 0x38: heartbeat  — written by shellcode at runtime, leave 0
 
     fprintf(stderr, "[UMM-DBG] Shellcode: codeSize=%zu dataBase=0x%llX stackBase=0x%llX leaDisp=%d\n",
             CODE_SIZE, dataBase, stackBase, leaDisp);
@@ -926,34 +1142,20 @@ bool UserModeMapper::ExecuteEntryPoint(HANDLE hProcess, DWORD pid) {
 
     uintptr_t entryAddr = m_mappedBase + m_entryPointRva;
 
-    // 1. Select a target thread to hijack
-    DWORD targetTid = SelectTargetThread(pid, hProcess);
-    if (!targetTid) {
+    // 1. Select a target thread to hijack.
+    //    Returns the thread ALREADY SUSPENDED — no race window between
+    //    inspection and hijack where the thread could enter a kernel wait.
+    HANDLE hThread = SelectTargetThread(pid, hProcess);
+    if (!hThread) {
         fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: no suitable thread\n");
         return false;
     }
 
-    // 2. Open the thread and suspend it
-    HANDLE hThread = OpenThread(
-        THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME,
-        FALSE, targetTid);
-    if (!hThread) {
-        fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: OpenThread(TID=%lu) failed (err=%lu)\n",
-                targetTid, GetLastError());
-        return false;
-    }
+    DWORD targetTid = GetThreadId(hThread);
+    m_lastHijackedTid = targetTid;
+    fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: using pre-suspended TID=%lu\n", targetTid);
 
-    DWORD prevCount = SuspendThread(hThread);
-    if (prevCount == (DWORD)-1) {
-        fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: SuspendThread failed (err=%lu)\n",
-                GetLastError());
-        CloseHandle(hThread);
-        return false;
-    }
-    fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: TID=%lu suspended (prevCount=%lu)\n",
-            targetTid, prevCount);
-
-    // 3. Get current thread context (RIP and RSP)
+    // 2. Get current thread context (RIP and RSP) — thread is already frozen
     CONTEXT ctx{};
     ctx.ContextFlags = CONTEXT_CONTROL;
     if (!GetThreadContext(hThread, &ctx)) {
@@ -966,14 +1168,33 @@ bool UserModeMapper::ExecuteEntryPoint(HANDLE hProcess, DWORD pid) {
 
     uintptr_t originalRip = ctx.Rip;
     uintptr_t originalRsp = ctx.Rsp;
-    fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: original RIP=0x%llX RSP=0x%llX\n",
-            originalRip, originalRsp);
 
-    // 4. Calculate shellcode location (aligned 16-byte after PE image)
+    // Resolve which module the original RIP lives in (diagnostic)
+    const char* ripModule = "unknown";
+    HANDLE hModSnap2 = CreateToolhelp32Snapshot(
+        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (hModSnap2 != INVALID_HANDLE_VALUE) {
+        MODULEENTRY32 me2{sizeof(me2)};
+        if (Module32First(hModSnap2, &me2)) {
+            do {
+                uintptr_t base = reinterpret_cast<uintptr_t>(me2.modBaseAddr);
+                uintptr_t end  = base + me2.modBaseSize;
+                if (originalRip >= base && originalRip < end) {
+                    ripModule = me2.szModule;
+                    break;
+                }
+            } while (Module32Next(hModSnap2, &me2));
+        }
+        CloseHandle(hModSnap2);
+    }
+    fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: original RIP=0x%llX (%s) RSP=0x%llX\n",
+            originalRip, ripModule, originalRsp);
+
+    // 3. Calculate shellcode location (aligned 16-byte after PE image)
     uintptr_t codePage = m_mappedBase + m_imageSize;
     codePage = (codePage + 15) & ~15ULL;
 
-    // 5. Build and write shellcode
+    // 4. Build and write shellcode
     std::vector<uint8_t> shellcode = BuildHijackShellcode(
         m_mappedBase, entryAddr, originalRip, originalRsp);
 
@@ -990,7 +1211,45 @@ bool UserModeMapper::ExecuteEntryPoint(HANDLE hProcess, DWORD pid) {
     fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: wrote %zu bytes shellcode at 0x%llX\n",
             written, codePage);
 
-    // 6. Redirect thread: set RIP to shellcode entry point
+    // Verify: read back first 32 bytes from target to confirm WPM worked
+    {
+        uint8_t verifyBuf[32] = {};
+        SIZE_T vbytes = 0;
+        if (ReadProcessMemory(hProcess, reinterpret_cast<LPCVOID>(codePage),
+                              verifyBuf, sizeof(verifyBuf), &vbytes)) {
+            fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: verify read back %zu bytes: ",
+                    vbytes);
+            for (SIZE_T vi = 0; vi < vbytes && vi < 32; vi++)
+                fprintf(stderr, "%02X ", verifyBuf[vi]);
+            fprintf(stderr, "\n");
+            // Check first byte is 0x4C (REX.WR for lea r11)
+            if (verifyBuf[0] != 0x4C) {
+                fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: *** MISMATCH: first byte is 0x%02X, expected 0x4C ***\n",
+                        verifyBuf[0]);
+            }
+        } else {
+            fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: verify ReadProcessMemory FAILED (err=%lu)\n",
+                    GetLastError());
+        }
+
+        // Query the actual page protection the target OS sees
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQueryEx(hProcess, reinterpret_cast<LPCVOID>(codePage),
+                          &mbi, sizeof(mbi))) {
+            fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: page protect=0x%lX state=0x%lX type=0x%lX\n",
+                    mbi.Protect, mbi.State, mbi.Type);
+        }
+
+        // Write a minimal "loop forever" test shellcode at offset 0x200
+        // to verify basic execution from our allocated page works.
+        uint8_t testLoop[] = { 0xEB, 0xFE }; // jmp -2 (infinite loop)
+        SIZE_T testWritten = 0;
+        WriteProcessMemory(hProcess,
+                          reinterpret_cast<LPVOID>(codePage + 0x200),
+                          testLoop, sizeof(testLoop), &testWritten);
+    }
+
+    // 5. Redirect thread: set RIP to shellcode entry point
     ctx.Rip = codePage;
     // RSP is left as-is — the shellcode saves and restores it.
 
@@ -1002,17 +1261,29 @@ bool UserModeMapper::ExecuteEntryPoint(HANDLE hProcess, DWORD pid) {
         return false;
     }
 
-    // 7. Resume the thread — shellcode calls DllMain, then jumps back
+    // 6. Resume the thread — shellcode calls DllMain, then jumps back.
+    //    The thread may still be blocked in a kernel wait. Use NtAlertThread
+    //    to attempt breaking alertable waits so the shellcode runs immediately.
     DWORD resumeResult = ResumeThread(hThread);
     fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: ResumeThread returned %lu (0=resumed from 1)\n",
             resumeResult);
+
+    // Attempt to wake the thread from alertable kernel wait.
+    // If NtAlertThread succeeds, the thread returns from its wait immediately
+    // with STATUS_ALERTED and executes our shellcode. If it fails (thread not
+    // in alertable wait), our shellcode executes when the wait completes naturally.
+    NTSTATUS alertStatus = NtAlertThread(hThread);
+    fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: NtAlertThread returned 0x%08lX (%s)\n",
+            alertStatus, alertStatus >= 0 ? "alerted" : "not alerted (non-alertable wait)");
     CloseHandle(hThread);
 
-    // 8. Poll the 'done' marker to confirm DllMain returned
+    // 7. Poll the 'done' marker to confirm DllMain returned.
     //    InitPayload is minimal (just a flag set), so this should be fast.
+    //    If NtAlertThread succeeded, the shellcode runs within microseconds.
+    //    If not, the thread executes when its wait completes naturally.
     uintptr_t doneAddr = codePage + 0x300 + 0x30; // data offset + done slot
     uint64_t doneVal = 0;
-    for (int i = 0; i < 30; ++i) { // up to 3 seconds
+    for (int i = 0; i < 50; ++i) { // up to 5 seconds
         Sleep(100);
         SIZE_T bytesRead = 0;
         if (ReadProcessMemory(hProcess,
@@ -1026,7 +1297,742 @@ bool UserModeMapper::ExecuteEntryPoint(HANDLE hProcess, DWORD pid) {
         }
     }
 
-    fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: WARNING — done marker not set after 3s "
-            "(DllMain may still be running or thread may have crashed)\n");
-    return true; // Thread was resumed — consider it a success even if marker didn't flip
+    // ── Diagnostics ──
+    // Always read heartbeat + done marker (survives thread termination).
+    uintptr_t heartbeatAddr = codePage + 0x300 + 0x38;
+    uint64_t heartbeatVal = 0, finalDoneVal = 0;
+    {
+        SIZE_T hbBytes = 0, dnBytes = 0;
+        ReadProcessMemory(hProcess, reinterpret_cast<LPCVOID>(heartbeatAddr),
+                         &heartbeatVal, sizeof(heartbeatVal), &hbBytes);
+        ReadProcessMemory(hProcess, reinterpret_cast<LPCVOID>(doneAddr),
+                         &finalDoneVal, sizeof(finalDoneVal), &dnBytes);
+    }
+
+    // Also try to read the thread's RIP
+    HANDLE hDiagThread = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                                     FALSE, targetTid);
+    if (hDiagThread) {
+        CONTEXT diagCtx{};
+        diagCtx.ContextFlags = CONTEXT_CONTROL;
+        if (GetThreadContext(hDiagThread, &diagCtx)) {
+            fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: after 5s, thread RIP=0x%llX "
+                    "(shellcode=0x%llX, original=0x%llX) heartbeat=%llu done=%llu\n",
+                    diagCtx.Rip, static_cast<unsigned long long>(codePage),
+                    static_cast<unsigned long long>(originalRip),
+                    heartbeatVal, finalDoneVal);
+            if (heartbeatVal == 1 && finalDoneVal == 0) {
+                fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: *** HEARTBEAT=1, DONE=0 *** "
+                        "→ shellcode executed, DllMain CRASHED\n");
+            } else if (heartbeatVal == 0) {
+                fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: heartbeat=0 → "
+                        "shellcode NEVER executed past heartbeat write\n");
+            }
+        } else {
+            fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: GetThreadContext(diag) failed (err=%lu) "
+                    "heartbeat=%llu done=%llu\n", GetLastError(), heartbeatVal, finalDoneVal);
+        }
+        CloseHandle(hDiagThread);
+    } else {
+        fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: OpenThread(diag) for TID=%lu failed "
+                "(err=%lu) heartbeat=%llu done=%llu — thread TERMINATED\n",
+                targetTid, GetLastError(), heartbeatVal, finalDoneVal);
+        if (heartbeatVal == 1 && finalDoneVal == 0) {
+            fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: *** HEARTBEAT=1, DONE=0 *** "
+                    "→ shellcode executed, DllMain CRASHED (thread killed)\n");
+        } else if (heartbeatVal == 0) {
+            fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: heartbeat=0 → "
+                    "shellcode NEVER executed (SetThreadContext silently ignored)\n");
+        }
+    }
+
+    fprintf(stderr, "[UMM-DBG] ExecuteEntryPoint: FAIL — done marker not set after 5s "
+            "(thread still in kernel wait, DllMain crashed, or shellcode never executed)\n");
+    return false;
+}
+
+// ---- APC-based Execution (bypasses anti-cheat RIP-range checks) -------------
+
+std::vector<uint8_t> UserModeMapper::BuildApcShellcode(
+    uintptr_t mappedBase, uintptr_t entryAddr)
+{
+    // APC shellcode: simpler than hijack shellcode — no stack switch,
+    // no jmp-back. The kernel's APC dispatcher saves/restores context.
+    //
+    // Function signature: void CALLBACK ApcRoutine(ULONG_PTR dwParam)
+    //   rcx = dwParam = pointer to data area
+    //
+    // Data slot layout (offset from data base):
+    //   +0x00: hModule       (mapped DLL base)
+    //   +0x08: dllMain       (mappedBase + entryPointRva)
+    //   +0x10: done marker   (written by shellcode before ret)
+
+    constexpr uint32_t DATA_OFFSET = 0x100;  // data at offset 0x100 within page
+    uintptr_t codePage = mappedBase + m_imageSize;
+    codePage = (codePage + 15) & ~15ULL;
+    uintptr_t dataBase = codePage + DATA_OFFSET;
+
+    // lea rax, [rip + data] — need REX.W for 64-bit
+    int32_t leaDisp = static_cast<int32_t>(dataBase - (codePage + 7));
+
+    uint8_t code[] = {
+        // ── 1. Save volatile regs and dwParam (rcx) ──
+        // push rcx                     ; dwParam = data pointer
+        0x51,
+        // push rdx
+        0x52,
+        // push r8
+        0x41, 0x50,
+        // push r9
+        0x41, 0x51,
+        // push r10
+        0x41, 0x52,
+        // push r11
+        0x41, 0x53,
+        // push rax
+        0x50,
+        // pushfq
+        0x9C,
+
+        // ── 2. Shadow space (32 bytes, maintains 16-byte alignment) ──
+        // After 8 pushes (64 bytes) + sub rsp,0x20 (32 bytes) = 96 = 6*16 ✓
+        // sub rsp, 0x20
+        0x48, 0x83, 0xEC, 0x20,
+
+        // ── 3. Reload data pointer (rcx may have been clobbered) ──
+        // We saved it on the stack; read it back relative to RSP.
+        // After 8 pushes (64) + sub rsp,0x20 (32) = 96 bytes below saved rcx.
+        // Saved rcx is at RSP + 0x20 + 7*8 = RSP + 0x20 + 56 = RSP + 0x58
+        // mov rax, [rsp + 0x58]       ; recover dwParam (saved rcx)
+        0x48, 0x8B, 0x84, 0x24, 0x58, 0x00, 0x00, 0x00,
+
+        // ── 4. Heartbeat: write 1 to [rax + 0x18] ──
+        // mov qword [rax + 0x18], 1
+        0x48, 0xC7, 0x40, 0x18, 0x01, 0x00, 0x00, 0x00,
+
+        // ── 5. Call DllMain(hModule, DLL_PROCESS_ATTACH, NULL) ──
+        // mov rcx, [rax + 0x00]       ; hModule
+        0x48, 0x8B, 0x48, 0x00,
+        // mov rdx, 1                   ; fdwReason
+        0x48, 0xC7, 0xC2, 0x01, 0x00, 0x00, 0x00,
+        // xor r8, r8                   ; lpReserved
+        0x4D, 0x31, 0xC0,
+        // push rax                     ; save data pointer before call
+        0x50,
+        // mov rax, [rax + 0x08]       ; DllMain address
+        0x48, 0x8B, 0x40, 0x08,
+        // call rax
+        0xFF, 0xD0,
+        // pop rax                      ; restore data pointer
+        0x58,
+
+        // ── 6. Set done marker ──
+        // mov qword [rax + 0x10], 1
+        0x48, 0xC7, 0x40, 0x10, 0x01, 0x00, 0x00, 0x00,
+
+        // ── 7. Restore shadow space ──
+        // add rsp, 0x20
+        0x48, 0x83, 0xC4, 0x20,
+
+        // ── 8. Restore volatile regs (reverse order) ──
+        // popfq
+        0x9D,
+        // pop rax
+        0x58,
+        // pop r11
+        0x41, 0x5B,
+        // pop r10
+        0x41, 0x5A,
+        // pop r9
+        0x41, 0x59,
+        // pop r8
+        0x41, 0x58,
+        // pop rdx
+        0x5A,
+        // pop rcx
+        0x59,
+
+        // ── 9. Return to APC dispatcher ──
+        // ret
+        0xC3,
+    };
+
+    // Build the full page
+    std::vector<uint8_t> page(0x1000, 0);
+    std::memcpy(page.data(), code, sizeof(code));
+
+    // Patch data slots at offset DATA_OFFSET
+    uint8_t* data = page.data() + DATA_OFFSET;
+    auto patchData = [&](size_t off, uintptr_t val) {
+        std::memcpy(data + off, &val, sizeof(val));
+    };
+    patchData(0x00, mappedBase);   // hModule
+    patchData(0x08, entryAddr);    // DllMain
+    // 0x10: done      — written by shellcode at runtime
+    // 0x18: heartbeat  — written by shellcode at runtime
+
+    return page;
+}
+
+bool UserModeMapper::TryApcExecute(HANDLE hProcess, DWORD pid) {
+    if (!m_entryPointRva)
+        return true;
+
+    uintptr_t entryAddr = m_mappedBase + m_entryPointRva;
+    uintptr_t codePage = m_mappedBase + m_imageSize;
+    codePage = (codePage + 15) & ~15ULL;
+    uintptr_t dataBase = codePage + 0x100;
+
+    fprintf(stderr, "[UMM-APC] TryApcExecute: entry=0x%llX codePage=0x%llX dataBase=0x%llX\n",
+            entryAddr, codePage, dataBase);
+
+    // 1. Build and write APC shellcode
+    std::vector<uint8_t> apcShellcode = BuildApcShellcode(m_mappedBase, entryAddr);
+    SIZE_T written = 0;
+    if (!WriteProcessMemory(hProcess, reinterpret_cast<LPVOID>(codePage),
+                            apcShellcode.data(), apcShellcode.size(), &written)) {
+        fprintf(stderr, "[UMM-APC] WriteProcessMemory failed (err=%lu)\n", GetLastError());
+        return false;
+    }
+    fprintf(stderr, "[UMM-APC] wrote %zu bytes APC shellcode at 0x%llX\n", written, codePage);
+
+    // 2. Enumerate threads — collect all candidates, main thread FIRST.
+    //    The main/GUI thread runs a message loop (GetMessage/PeekMessage) which
+    //    are alertable waits. When we PostThreadMessage + QueueUserAPC, the
+    //    kernel delivers the APC before returning the message.
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "[UMM-APC] CreateToolhelp32Snapshot failed (err=%lu)\n", GetLastError());
+        return false;
+    }
+
+    THREADENTRY32 te{sizeof(te)};
+    std::vector<DWORD> threadIds;
+    DWORD mainTid = 0;
+    bool hasMain = false;
+
+    if (Thread32First(hSnap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != pid) continue;
+            if (te.th32ThreadID == m_lastHijackedTid) continue;
+
+            if (!hasMain) {
+                // Main thread goes first — most likely alertable (GUI thread)
+                mainTid = te.th32ThreadID;
+                hasMain = true;
+            } else {
+                threadIds.push_back(te.th32ThreadID);
+            }
+        } while (Thread32Next(hSnap, &te));
+    }
+    CloseHandle(hSnap);
+
+    // Build ordered list: main thread first, then all others
+    std::vector<DWORD> orderedIds;
+    if (mainTid) orderedIds.push_back(mainTid);
+    orderedIds.insert(orderedIds.end(), threadIds.begin(), threadIds.end());
+
+    fprintf(stderr, "[UMM-APC] %zu candidate threads (main TID=%lu first)\n",
+            orderedIds.size(), mainTid);
+
+    // 3. Try each thread — early exit after N consecutive "never delivered"
+    bool success = false;
+    int consecutiveNeverDelivered = 0;
+    constexpr int kMaxConsecutiveNever = 5;
+    for (DWORD tid : orderedIds) {
+        // THREAD_ALERT (0x0004) is needed for NtAlertThread to succeed.
+        // Without it, NtAlertThread returns STATUS_ACCESS_DENIED (0xC0000022).
+        constexpr DWORD kThreadAccess = THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME
+                                       | THREAD_QUERY_INFORMATION | 0x0004; // THREAD_ALERT
+        HANDLE hThread = OpenThread(kThreadAccess, FALSE, tid);
+        if (!hThread) {
+            fprintf(stderr, "[UMM-APC] OpenThread TID=%lu failed (err=%lu)\n", tid, GetLastError());
+            continue;
+        }
+
+        // Step A: Queue the APC. dwParam points to the data area (hModule, DllMain, etc.)
+        DWORD queued = QueueUserAPC(
+            reinterpret_cast<PAPCFUNC>(codePage),
+            hThread,
+            static_cast<ULONG_PTR>(dataBase));
+
+        fprintf(stderr, "[UMM-APC] QueueUserAPC TID=%lu: %s (err=%lu)\n",
+                tid, queued ? "QUEUED" : "FAILED",
+                queued ? 0 : GetLastError());
+
+        if (!queued) {
+            CloseHandle(hThread);
+            continue;
+        }
+
+        // Step B: PostThreadMessage(WM_NULL) — force alertable wait in message loop.
+        // If the thread runs GetMessage/PeekMessage (GUI threads), posting a message
+        // triggers an alertable wait where the kernel delivers pending APCs BEFORE
+        // returning the message. Even if the thread lacks a message queue,
+        // PostThreadMessage creates one.
+        BOOL msgPosted = PostThreadMessageW(tid, WM_NULL, 0, 0);
+        fprintf(stderr, "[UMM-APC] PostThreadMessage(WM_NULL) TID=%lu: %s (err=%lu)\n",
+                tid, msgPosted ? "POSTED" : "FAILED",
+                msgPosted ? 0 : GetLastError());
+
+        // Step C: NtAlertThread — wake thread from alertable kernel wait.
+        // If the thread is in NtWaitForSingleObject/NtWaitForMultipleObjects
+        // with Alertable=TRUE, this forces an immediate return with STATUS_ALERTED.
+        NTSTATUS alertStatus = NtAlertThread(hThread);
+        fprintf(stderr, "[UMM-APC] NtAlertThread TID=%lu: 0x%08lX (%s)\n",
+                tid, alertStatus,
+                alertStatus >= 0 ? "ALERTED — APC should fire immediately"
+                                 : "not alerted (non-alertable wait or no THREAD_ALERT access)");
+
+        CloseHandle(hThread);
+
+        // Step D: Poll the done marker for up to 5 seconds
+        uintptr_t doneAddr = dataBase + 0x10;
+        uint64_t doneVal = 0;
+        for (int i = 0; i < 50; ++i) {
+            Sleep(100);
+            SIZE_T bytesRead = 0;
+            if (ReadProcessMemory(hProcess,
+                                 reinterpret_cast<LPCVOID>(doneAddr),
+                                 &doneVal, sizeof(doneVal), &bytesRead)) {
+                if (doneVal == 1) {
+                    fprintf(stderr, "[UMM-APC] DONE via TID=%lu after %dms — SUCCESS\n",
+                            tid, (i + 1) * 100);
+                    success = true;
+                    break;
+                }
+            }
+        }
+        if (success) break;
+
+        // Check heartbeat to distinguish "never ran" from "ran but crashed"
+        uintptr_t hbAddr = dataBase + 0x18;
+        uint64_t hbVal = 0;
+        ReadProcessMemory(hProcess, reinterpret_cast<LPCVOID>(hbAddr),
+                         &hbVal, sizeof(hbVal), nullptr);
+        if (hbVal == 1) {
+            fprintf(stderr, "[UMM-APC] TID=%lu: heartbeat=1 done=0 → APC delivered, DllMain CRASHED\n",
+                    tid);
+            consecutiveNeverDelivered = 0;
+        } else {
+            fprintf(stderr, "[UMM-APC] TID=%lu: heartbeat=0 → APC NEVER delivered (thread not alertable)\n",
+                    tid);
+            consecutiveNeverDelivered++;
+            if (consecutiveNeverDelivered >= kMaxConsecutiveNever) {
+                fprintf(stderr, "[UMM-APC] %d consecutive threads never delivered — "
+                        "Hyperion is filtering APCs, skipping remaining threads\n",
+                        kMaxConsecutiveNever);
+                break;
+            }
+        }
+    }
+
+    if (!success)
+        fprintf(stderr, "[UMM-APC] FAIL: no thread delivered APC. All threads non-alertable.\n");
+    return success;
+}
+
+// ---- Code-Cave Execution (kernel R/W bypass for Hyperion RIP-range checks) ----
+
+std::vector<uint8_t> UserModeMapper::BuildCaveApcShellcode() {
+    // Compact APC-compatible shellcode that fits in ~80 bytes.
+    // Designed for code-cave injection: the shellcode lives in module padding,
+    // data (hModule, DllMain, done, heartbeat) lives in a separate RWX allocation.
+    //
+    // void CALLBACK ApcRoutine(ULONG_PTR dwParam)
+    //   rcx = dwParam = pointer to data area:
+    //     +0x00: hModule
+    //     +0x08: DllMain
+    //     +0x10: done marker
+    //     +0x18: heartbeat marker
+    //
+    // Stack layout after sub rsp,0x20:
+    //   rsp+0x20: pushfq → rsp+0x28: rax → ... → rsp+0x58: rcx (data ptr)
+    //
+    // 8 pushes (64 bytes) + sub rsp,0x20 (32 bytes) = 96 = 6×16 ✓ aligned
+
+    uint8_t code[] = {
+        // ── Save volatile registers (x64 calling convention) ──
+        0x51,                         // push rcx    ; data pointer
+        0x52,                         // push rdx
+        0x41, 0x50,                   // push r8
+        0x41, 0x51,                   // push r9
+        0x41, 0x52,                   // push r10
+        0x41, 0x53,                   // push r11
+        0x50,                         // push rax
+        0x9C,                         // pushfq
+
+        // ── Shadow space (32 bytes) ──
+        0x48, 0x83, 0xEC, 0x20,       // sub rsp, 0x20
+
+        // ── Recover data pointer from stack ──
+        // rcx was pushed first; after sub rsp,0x20 it's at rsp+0x20+7*8 = rsp+0x58
+        0x48, 0x8B, 0x84, 0x24, 0x58, 0x00, 0x00, 0x00,
+        // mov rax, [rsp + 0x58]
+
+        // ── Heartbeat: write 1 before calling DllMain ──
+        0x48, 0xC7, 0x40, 0x18, 0x01, 0x00, 0x00, 0x00,
+        // mov qword [rax + 0x18], 1
+
+        // ── Call DllMain(hModule, DLL_PROCESS_ATTACH, NULL) ──
+        0x48, 0x8B, 0x48, 0x00,       // mov rcx, [rax + 0x00]  ; hModule
+        0x48, 0xC7, 0xC2, 0x01, 0x00, 0x00, 0x00,
+        // mov rdx, 1                ; DLL_PROCESS_ATTACH
+        0x4D, 0x31, 0xC0,             // xor r8, r8              ; NULL
+        0x50,                         // push rax               ; save data ptr
+        0x48, 0x8B, 0x40, 0x08,       // mov rax, [rax + 0x08]  ; DllMain addr
+        0xFF, 0xD0,                   // call rax
+        0x58,                         // pop rax                ; restore data ptr
+
+        // ── Done marker ──
+        0x48, 0xC7, 0x40, 0x10, 0x01, 0x00, 0x00, 0x00,
+        // mov qword [rax + 0x10], 1
+
+        // ── Restore registers ──
+        0x48, 0x83, 0xC4, 0x20,       // add rsp, 0x20
+        0x9D,                         // popfq
+        0x58,                         // pop rax
+        0x41, 0x5B,                   // pop r11
+        0x41, 0x5A,                   // pop r10
+        0x41, 0x59,                   // pop r9
+        0x41, 0x58,                   // pop r8
+        0x5A,                         // pop rdx
+        0x59,                         // pop rcx
+        0xC3,                         // ret
+    };
+
+    return std::vector<uint8_t>(code, code + sizeof(code));
+}
+
+bool UserModeMapper::FindCodeCave(DWORD pid, uintptr_t* outCaveAddr,
+                                   size_t* outCaveSize) {
+    auto& capcom = CapcomDriver::GetInstance();
+    if (!capcom.IsLoaded()) {
+        fprintf(stderr, "[UMM-CAVE] CapcomDriver not loaded — cannot find code cave\n");
+        return false;
+    }
+
+    // Try modules in order: main exe first, then common DLLs with lots of code
+    const char* candidateModules[] = {
+        "RobloxPlayerBeta.exe",
+        "vcruntime140.dll",   // often has padding
+        "msvcp140.dll",
+        "d3d11.dll",
+        "dxgi.dll",
+    };
+
+    for (const char* modName : candidateModules) {
+        uintptr_t modBase = FindModuleInTarget(pid, modName);
+        if (!modBase) {
+            fprintf(stderr, "[UMM-CAVE] Module '%s' not found in target\n", modName);
+            continue;
+        }
+
+        // Read PE headers via kernel R/W (bypasses Hyperion RPM hooks)
+        IMAGE_DOS_HEADER dos = capcom.Read<IMAGE_DOS_HEADER>(pid, modBase);
+        if (dos.e_magic != IMAGE_DOS_SIGNATURE) {
+            fprintf(stderr, "[UMM-CAVE] '%s': invalid DOS signature at 0x%llX\n",
+                    modName, modBase);
+            continue;
+        }
+
+        IMAGE_NT_HEADERS64 nt = capcom.Read<IMAGE_NT_HEADERS64>(
+            pid, modBase + dos.e_lfanew);
+        if (nt.Signature != IMAGE_NT_SIGNATURE) {
+            fprintf(stderr, "[UMM-CAVE] '%s': invalid NT signature\n", modName);
+            continue;
+        }
+
+        uintptr_t secTable = modBase + dos.e_lfanew + sizeof(IMAGE_NT_HEADERS64);
+        WORD numSections = nt.FileHeader.NumberOfSections;
+        uint32_t secAlign = nt.OptionalHeader.SectionAlignment;
+
+        fprintf(stderr, "[UMM-CAVE] '%s': base=0x%llX sections=%u secAlign=0x%X\n",
+                modName, modBase, numSections, secAlign);
+
+        // Scan each section for a gap between it and the NEXT section.
+        // This catches both intra-section padding (VirtualSize < aligned size)
+        // and inter-section gaps.
+        uintptr_t prevSecEnd = modBase + dos.e_lfanew
+                             + sizeof(IMAGE_NT_HEADERS64)
+                             + numSections * sizeof(IMAGE_SECTION_HEADER);
+        // ^ approximate: the section table itself sits in the header region
+
+        IMAGE_SECTION_HEADER prevSec{};
+        bool havePrev = false;
+        uintptr_t bestCave = 0;
+        size_t bestSize = 0;
+
+        for (WORD i = 0; i < numSections; ++i) {
+            IMAGE_SECTION_HEADER sec = capcom.Read<IMAGE_SECTION_HEADER>(
+                pid, secTable + i * sizeof(IMAGE_SECTION_HEADER));
+
+            uintptr_t secStart = modBase + sec.VirtualAddress;
+            size_t alignedSize = (sec.Misc.VirtualSize + secAlign - 1) & ~(secAlign - 1ULL);
+            uintptr_t secAlignedEnd = secStart + alignedSize;
+
+            // Check padding at end of this section
+            size_t padding = static_cast<size_t>(secAlignedEnd - (secStart + sec.Misc.VirtualSize));
+            bool isExec = (sec.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+
+            fprintf(stderr, "[UMM-CAVE]   '%s' VA=0x%X VSize=0x%X alignedEnd=0x%llX padding=%zu exec=%d\n",
+                    sec.Name, sec.VirtualAddress, sec.Misc.VirtualSize,
+                    secAlignedEnd, padding, isExec);
+
+            // Prefer executable-padded sections (Hyperion may check NX)
+            if (isExec && padding >= 128 && padding > bestSize) {
+                bestCave = secStart + sec.Misc.VirtualSize;
+                bestSize = padding;
+                fprintf(stderr, "[UMM-CAVE]   → executable cave candidate: 0x%llX size=%zu\n",
+                        bestCave, bestSize);
+            }
+
+            // Also check gap between this section and the next
+            if (havePrev) {
+                uintptr_t prevEnd = modBase + prevSec.VirtualAddress
+                                  + ((prevSec.Misc.VirtualSize + secAlign - 1) & ~(secAlign - 1ULL));
+                if (secStart > prevEnd) {
+                    size_t gap = static_cast<size_t>(secStart - prevEnd);
+                    bool prevExec = (prevSec.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+                    fprintf(stderr, "[UMM-CAVE]   inter-section gap after '%s': 0x%llX size=%zu exec=%d\n",
+                            prevSec.Name, prevEnd, gap, prevExec);
+                    // The gap inherits characteristics from neither section exactly,
+                    // but it's within the module's mapped range — Hyperion accepts it.
+                    if (gap >= 128 && gap > bestSize) {
+                        bestCave = prevEnd;
+                        bestSize = gap;
+                    }
+                }
+            }
+
+            prevSec = sec;
+            havePrev = true;
+        }
+
+        // Also check padding after the last section (rarely useful but worth a shot)
+        if (havePrev) {
+            uintptr_t lastEnd = modBase + prevSec.VirtualAddress
+                              + ((prevSec.Misc.VirtualSize + secAlign - 1) & ~(secAlign - 1ULL));
+            uintptr_t moduleEnd = modBase + nt.OptionalHeader.SizeOfImage;
+            if (moduleEnd > lastEnd) {
+                size_t tailGap = static_cast<size_t>(moduleEnd - lastEnd);
+                fprintf(stderr, "[UMM-CAVE]   tail gap after last section: 0x%llX size=%zu\n",
+                        lastEnd, tailGap);
+                if (tailGap >= 128 && tailGap > bestSize) {
+                    bestCave = lastEnd;
+                    bestSize = tailGap;
+                }
+            }
+        }
+
+        if (bestCave && bestSize >= 128) {
+            *outCaveAddr = bestCave;
+            *outCaveSize = bestSize;
+            fprintf(stderr, "[UMM-CAVE] selected cave in '%s': 0x%llX size=%zu\n",
+                    modName, bestCave, bestSize);
+            return true;
+        }
+    }
+
+    fprintf(stderr, "[UMM-CAVE] no suitable code cave found (need ≥128 bytes)\n");
+    return false;
+}
+
+bool UserModeMapper::TryKernelCodeCaveExecute(HANDLE hProcess, DWORD pid) {
+    if (!m_entryPointRva) {
+        fprintf(stderr, "[UMM-CAVE] No entry point — resource-only DLL, success\n");
+        return true;
+    }
+
+    auto& capcom = CapcomDriver::GetInstance();
+    if (!capcom.IsLoaded()) {
+        fprintf(stderr, "[UMM-CAVE] CapcomDriver not loaded — code cave requires kernel R/W\n");
+        return false;
+    }
+
+    uintptr_t entryAddr = m_mappedBase + m_entryPointRva;
+
+    // 1. Find a code cave in a loaded module
+    uintptr_t caveAddr = 0;
+    size_t caveSize = 0;
+    if (!FindCodeCave(pid, &caveAddr, &caveSize)) {
+        fprintf(stderr, "[UMM-CAVE] no code cave found\n");
+        return false;
+    }
+
+    // 2. Build compact APC shellcode
+    std::vector<uint8_t> shellcode = BuildCaveApcShellcode();
+    fprintf(stderr, "[UMM-CAVE] built %zu-byte cave shellcode\n", shellcode.size());
+
+    if (shellcode.size() > caveSize) {
+        fprintf(stderr, "[UMM-CAVE] shellcode too large (%zu > cave %zu)\n",
+                shellcode.size(), caveSize);
+        return false;
+    }
+
+    // 3. Write shellcode to cave via kernel R/W (bypasses VirtualProtectEx hooks)
+    if (!capcom.WriteMemory(pid, caveAddr, shellcode.data(), shellcode.size())) {
+        fprintf(stderr, "[UMM-CAVE] WriteMemory to cave 0x%llX failed\n", caveAddr);
+        return false;
+    }
+    fprintf(stderr, "[UMM-CAVE] wrote %zu bytes to cave 0x%llX via kernel R/W\n",
+            shellcode.size(), caveAddr);
+
+    // Verify: read back via kernel R/W
+    {
+        std::vector<uint8_t> verify(shellcode.size());
+        capcom.ReadMemory(pid, caveAddr, verify.data(), verify.size());
+        bool match = (memcmp(verify.data(), shellcode.data(), shellcode.size()) == 0);
+        fprintf(stderr, "[UMM-CAVE] verify read-back: %s\n", match ? "MATCH" : "MISMATCH");
+        if (!match) {
+            fprintf(stderr, "[UMM-CAVE] first bytes: ");
+            for (size_t j = 0; j < (std::min)(verify.size(), (size_t)16); j++)
+                fprintf(stderr, "%02X ", verify[j]);
+            fprintf(stderr, "\n");
+        }
+    }
+
+    // 4. Set up data page in our existing RWX allocation
+    //    (data page is just 4 qwords — doesn't trigger Hyperion because it's
+    //     only read by the shellcode, not executed)
+    uintptr_t codePage = m_mappedBase + m_imageSize;
+    codePage = (codePage + 15) & ~15ULL;
+    uintptr_t dataBase = codePage + 0x100;
+
+    uint64_t dataSlots[4] = {
+        m_mappedBase,  // +0x00: hModule
+        entryAddr,     // +0x08: DllMain
+        0,             // +0x10: done marker (shellcode writes 1)
+        0,             // +0x18: heartbeat (shellcode writes 1)
+    };
+
+    SIZE_T written = 0;
+    if (!WriteProcessMemory(hProcess, reinterpret_cast<LPVOID>(dataBase),
+                            dataSlots, sizeof(dataSlots), &written)) {
+        fprintf(stderr, "[UMM-CAVE] WriteProcessMemory(data) failed (err=%lu)\n", GetLastError());
+        return false;
+    }
+    fprintf(stderr, "[UMM-CAVE] wrote data slots at 0x%llX (hModule=0x%llX, DllMain=0x%llX)\n",
+            dataBase, m_mappedBase, entryAddr);
+
+    // 5. Enumerate threads — prefer main thread (GUI thread, most alertable)
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "[UMM-CAVE] CreateToolhelp32Snapshot failed (err=%lu)\n", GetLastError());
+        return false;
+    }
+
+    THREADENTRY32 te{sizeof(te)};
+    std::vector<DWORD> threadIds;
+    DWORD mainTid = 0;
+
+    if (Thread32First(hSnap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != pid) continue;
+            if (te.th32ThreadID == m_lastHijackedTid) continue;
+            if (!mainTid) {
+                mainTid = te.th32ThreadID;  // first thread = main, goes first
+            } else {
+                threadIds.push_back(te.th32ThreadID);
+            }
+        } while (Thread32Next(hSnap, &te));
+    }
+    CloseHandle(hSnap);
+
+    // Main thread first (GUI thread, message loop = alertable)
+    std::vector<DWORD> orderedIds;
+    if (mainTid) orderedIds.push_back(mainTid);
+    orderedIds.insert(orderedIds.end(), threadIds.begin(), threadIds.end());
+
+    fprintf(stderr, "[UMM-CAVE] %zu candidate threads (main TID=%lu first)\n",
+            orderedIds.size(), mainTid);
+
+    // 6. Try APC delivery to each thread
+    bool success = false;
+    int consecutiveNeverDelivered = 0;
+    constexpr int kMaxConsecutiveNever = 5;
+    constexpr DWORD kThreadAccess = THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME
+                                   | THREAD_QUERY_INFORMATION | 0x0004; // THREAD_ALERT
+
+    for (DWORD tid : orderedIds) {
+        HANDLE hThread = OpenThread(kThreadAccess, FALSE, tid);
+        if (!hThread) {
+            fprintf(stderr, "[UMM-CAVE] OpenThread TID=%lu failed (err=%lu)\n",
+                    tid, GetLastError());
+            continue;
+        }
+
+        // Queue APC: function at caveAddr (inside module), dwParam = dataBase
+        DWORD queued = QueueUserAPC(
+            reinterpret_cast<PAPCFUNC>(caveAddr),
+            hThread,
+            static_cast<ULONG_PTR>(dataBase));
+
+        fprintf(stderr, "[UMM-CAVE] QueueUserAPC(cave=0x%llX, data=0x%llX) TID=%lu: %s (err=%lu)\n",
+                caveAddr, dataBase, tid,
+                queued ? "QUEUED" : "FAILED",
+                queued ? 0 : GetLastError());
+
+        if (!queued) {
+            CloseHandle(hThread);
+            continue;
+        }
+
+        // Force delivery: post message + alert thread
+        BOOL msgPosted = PostThreadMessageW(tid, WM_NULL, 0, 0);
+        fprintf(stderr, "[UMM-CAVE] PostThreadMessage(WM_NULL) TID=%lu: %s (err=%lu)\n",
+                tid, msgPosted ? "POSTED" : "FAILED",
+                msgPosted ? 0 : GetLastError());
+
+        NTSTATUS alertStatus = NtAlertThread(hThread);
+        fprintf(stderr, "[UMM-CAVE] NtAlertThread TID=%lu: 0x%08lX (%s)\n",
+                tid, alertStatus,
+                alertStatus >= 0 ? "ALERTED" : "not alerted");
+
+        CloseHandle(hThread);
+
+        // Poll done marker
+        uintptr_t doneAddr = dataBase + 0x10;
+        uint64_t doneVal = 0;
+        for (int i = 0; i < 50; ++i) {
+            Sleep(100);
+            SIZE_T bytesRead = 0;
+            if (ReadProcessMemory(hProcess,
+                                 reinterpret_cast<LPCVOID>(doneAddr),
+                                 &doneVal, sizeof(doneVal), &bytesRead)) {
+                if (doneVal == 1) {
+                    fprintf(stderr, "[UMM-CAVE] DONE via TID=%lu after %dms — SUCCESS\n",
+                            tid, (i + 1) * 100);
+                    success = true;
+                    break;
+                }
+            }
+        }
+        if (success) break;
+
+        // Check heartbeat
+        uintptr_t hbAddr = dataBase + 0x18;
+        uint64_t hbVal = 0;
+        ReadProcessMemory(hProcess, reinterpret_cast<LPCVOID>(hbAddr),
+                         &hbVal, sizeof(hbVal), nullptr);
+        if (hbVal == 1) {
+            fprintf(stderr, "[UMM-CAVE] TID=%lu: heartbeat=1 done=0 → "
+                    "APC delivered, DllMain CRASHED\n", tid);
+            consecutiveNeverDelivered = 0;
+        } else {
+            fprintf(stderr, "[UMM-CAVE] TID=%lu: heartbeat=0 → "
+                    "APC not delivered (thread not alertable, or Hyperion blocks)\n", tid);
+            consecutiveNeverDelivered++;
+            if (consecutiveNeverDelivered >= kMaxConsecutiveNever) {
+                fprintf(stderr, "[UMM-CAVE] %d consecutive never-delivered — "
+                        "Hyperion filtering, skipping remaining threads\n",
+                        kMaxConsecutiveNever);
+                break;
+            }
+        }
+    }
+
+    if (!success)
+        fprintf(stderr, "[UMM-CAVE] FAIL: no thread delivered cave APC\n");
+    return success;
 }

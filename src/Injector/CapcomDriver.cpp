@@ -19,21 +19,35 @@ bool CapcomDriver::LoadDriver() {
 
     m_ownPid = GetCurrentProcessId();
 
-    // 1. Enable SeLoadDriverPrivilege
+    // 1. Enable SeLoadDriverPrivilege + SeDebugPrivilege
+    //    SeLoadDriverPrivilege: needed to create/start the kernel driver service
+    //    SeDebugPrivilege:     needed when running as admin for VirtualAllocEx
+    //                          into a user-level process (cross-session access)
     HANDLE hToken;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
         return false;
 
-    LUID luid;
-    if (!LookupPrivilegeValueW(nullptr, L"SeLoadDriverPrivilege", &luid)) {
+    LUID luidLoadDriver, luidDebug;
+    if (!LookupPrivilegeValueW(nullptr, L"SeLoadDriverPrivilege", &luidLoadDriver)) {
         CloseHandle(hToken);
         return false;
     }
+    LookupPrivilegeValueW(nullptr, L"SeDebugPrivilege", &luidDebug);
+    // SeDebugPrivilege lookup failure is non-fatal — driver can still load without it
 
     TOKEN_PRIVILEGES tp{};
-    tp.PrivilegeCount = 1;
-    tp.Privileges[0].Luid = luid;
-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    tp.PrivilegeCount = 0;
+
+    tp.Privileges[tp.PrivilegeCount].Luid = luidLoadDriver;
+    tp.Privileges[tp.PrivilegeCount].Attributes = SE_PRIVILEGE_ENABLED;
+    tp.PrivilegeCount++;
+
+    if (luidDebug.HighPart || luidDebug.LowPart) {
+        tp.Privileges[tp.PrivilegeCount].Luid = luidDebug;
+        tp.Privileges[tp.PrivilegeCount].Attributes = SE_PRIVILEGE_ENABLED;
+        tp.PrivilegeCount++;
+    }
+
     AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
     CloseHandle(hToken);
 
